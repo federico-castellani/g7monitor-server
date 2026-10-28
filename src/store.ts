@@ -243,6 +243,10 @@ export class Store {
     };
   }
 
+  deviceExists(id: number): boolean {
+    return !!this.q('SELECT 1 FROM devices WHERE id = ?').get(id);
+  }
+
   touchDevice(id: number, ip: string): void {
     this.q('UPDATE devices SET last_used = ?, last_ip = ? WHERE id = ?').run(now(), ip, id);
   }

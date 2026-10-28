@@ -43,7 +43,13 @@ Server per [G7 Monitor](https://github.com/federico-castellani/g7monitor). Racco
 
 ## Telefoni che ricevono (modalità "Dal server")
 
-Il telefono non tiene una connessione sempre aperta, che sveglierebbe la radio ogni pochi secondi. Chiede `GET /api/v1/readings?since=…` appena dopo il momento in cui è attesa la prossima lettura (ultima lettura + 5 minuti + 20 secondi), quindi ogni richiesta porta di solito una sola lettura nuova. Se i dati sono in ritardo riprova ogni 2 minuti; dopo un errore aspetta 1, 2, 4… fino a 15 minuti.
+**In tempo reale.** Il telefono tiene aperta una connessione (`GET /api/v1/readings/stream`, Server-Sent Events) e il server gli spinge ogni lettura circa un secondo dopo che il telefono con il sensore l'ha caricata, come la sincronizzazione di xDrip.
+
+Al collegamento il server invia prima le letture che il telefono ha perso. Poi la linea resta silenziosa fino alla lettura successiva, salvo un segnale ogni 4 minuti e mezzo di inattività: quanto basta perché router e reti mobili non la chiudano. La radio si sveglia quindi circa una volta per lettura, come con le richieste periodiche, ma senza ritardo.
+
+Se la connessione cade, il telefono si ricollega dopo 5 s, 10 s, 20 s… fino a 5 minuti. Una sveglia ogni 10 minuti, attiva anche in Doze, verifica che la linea sia viva.
+
+Con un server vecchio senza `/stream`, il telefono torna da solo alle richieste periodiche (`GET /api/v1/readings?since=…`) subito dopo l'ora attesa della lettura successiva.
 
 ## Caricamento dall'app: batteria e dati
 
@@ -76,16 +82,18 @@ Per collegare il telefono serve un indirizzo **https**: l'app rifiuta http, quin
 
 Il TLS lo gestisce il tuo reverse proxy. Il container ascolta solo su `127.0.0.1:8080`, quindi non è raggiungibile da fuori senza passare dal proxy.
 
-1. Configura e avvia:
+1. Configura e avvia. L'immagine è già pronta su GitHub Container Registry, per x86 e ARM, quindi non serve compilare nulla:
    ```bash
+   git clone https://github.com/federico-castellani/g7monitor-server.git && cd g7monitor-server
    cp .env.example .env          # G7_DOMAIN = il dominio pubblico del proxy
-   docker compose up -d --build
+   docker compose up -d
    docker compose exec g7server node src/cli.ts add federico   # primo amministratore
    ```
+   Per compilare l'immagine da questi sorgenti invece di scaricarla: `docker compose up -d --build`.
 2. Nel reverse proxy inoltra `https://glicemie.example.com` a `http://127.0.0.1:8080`:
    - passa gli header `Host`, `X-Forwarded-For` e `X-Forwarded-Proto`;
    - accetta corpi fino a 1 MB;
-   - per `/api/readings/stream` (aggiornamento live del sito) disattiva il buffering e usa un timeout di lettura lungo.
+   - per `/api/readings/stream` (aggiornamento live del sito) e `/api/v1/readings/stream` (telefoni che ricevono) disattiva il buffering e usa un timeout di lettura di almeno 5 minuti. Il valore predefinito di nginx, 60 s, chiuderebbe la connessione dei telefoni tra un segnale e l'altro.
 
    Esempio con nginx:
    ```nginx
@@ -96,7 +104,7 @@ Il TLS lo gestisce il tuo reverse proxy. Il container ascolta solo su `127.0.0.1
        proxy_set_header X-Forwarded-Proto $scheme;
        client_max_body_size 1m;
    }
-   location /api/readings/stream {
+   location ~ /readings/stream$ {
        proxy_pass http://127.0.0.1:8080;
        proxy_set_header Host $host;
        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -109,6 +117,32 @@ Il TLS lo gestisce il tuo reverse proxy. Il container ascolta solo su `127.0.0.1
 3. Nell'app:
    - **telefono con il sensore**: *Impostazioni → Server (caricamento) → Configura server*. Inserisci l'indirizzo `glicemie.example.com`; se il server risponde, si apre la pagina delle credenziali. Serve un account con il permesso di caricare.
    - **telefono che riceve**: al primo avvio scegli *Dal server*, oppure *Impostazioni → Origine dei dati → Server*. Poi indirizzo e credenziali: basta un account in sola lettura.
+
+### Aggiornamento
+
+A ogni push su `main`, GitHub Actions esegue i test e, solo se passano, pubblica la nuova immagine `ghcr.io/federico-castellani/g7monitor-server:latest`. Sul server basta:
+
+```bash
+./update.sh
+```
+
+Lo script:
+- fa un backup del database nel volume (`/data/backup-pre-update-*.db`, conservato 30 giorni);
+- scarica l'immagine nuova e riavvia il container;
+- cancella le immagini vecchie;
+- mostra la versione in esecuzione.
+
+Le letture e gli utenti restano nel volume `g7data`, e le modifiche allo schema del database si applicano da sole all'avvio. Se non c'è nulla di nuovo, lo script non cambia niente: si può mettere anche in cron, per esempio ogni notte alle 4:
+
+```
+0 4 * * * /percorso/g7monitor-server/update.sh >> /var/log/g7monitor-update.log 2>&1
+```
+
+La versione in esecuzione si vede anche su `https://glicemie.example.com/healthz`.
+
+Per fissare una versione invece di seguire `latest`, crea un tag `v1.2.3` su GitHub. La CI pubblica anche `:1.2.3` e `:1.2`, che puoi indicare in `image:` nel `docker-compose.yml`.
+
+**Prima pubblicazione:** su GitHub i pacchetti nascono privati. Rendi pubblica l'immagine (*Packages → g7monitor-server → Package settings → Change visibility → Public*), oppure sul server esegui una volta `docker login ghcr.io` con un token che abbia il permesso `read:packages`.
 
 ## Gestione utenti
 
@@ -148,7 +182,8 @@ Con Docker: `docker compose exec g7server node src/cli.ts <comando>`.
 |---|---|---|---|
 | GET | `/api/v1/info` | nessuna | permette all'app di riconoscere un server G7 Monitor prima di chiedere le credenziali |
 | POST | `/api/v1/devices` | nome utente e password (+ TOTP) | collega un telefono e restituisce il token: `kind: "uploader"` per caricare (serve il permesso di caricare), `"reader"` per ricevere |
-| GET | `/api/v1/readings?since=` | `Bearer` (anche in sola lettura) | letture successive a `since`, per i telefoni che ricevono |
+| GET | `/api/v1/readings/stream?since=` | `Bearer` (anche in sola lettura) | letture in tempo reale per i telefoni che ricevono (SSE): prima quelle successive a `since`, poi ogni nuova |
+| GET | `/api/v1/readings?since=` | `Bearer` (anche in sola lettura) | letture successive a `since` (richiesta singola) |
 | POST | `/api/v1/readings` | `Bearer` token di caricamento | carica letture (`Content-Encoding: gzip` facoltativo) |
 | GET | `/api/v1/status` | `Bearer` | account e ultima lettura |
 | DELETE | `/api/v1/devices/self` | `Bearer` | il telefono revoca il proprio token |

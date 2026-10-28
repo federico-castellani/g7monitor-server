@@ -1,4 +1,4 @@
-import { SESSION_IDLE, SESSION_MAX, buildApp } from './app.ts';
+import { SESSION_IDLE, SESSION_MAX, VERSION, buildApp } from './app.ts';
 import { loadConfig } from './config.ts';
 import { openDb } from './db.ts';
 import { Store } from './store.ts';
@@ -28,3 +28,4 @@ process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
 await app.listen({ host: cfg.host, port: cfg.port });
+app.log.info(`G7 Monitor Server ${VERSION}`);

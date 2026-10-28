@@ -1,11 +1,15 @@
 # G7 Monitor server, behind your own reverse proxy (which handles TLS).
 # 1. cp .env.example .env and fill it in
-# 2. docker compose up -d --build
+# 2. docker compose up -d
 # 3. docker compose exec g7server node src/cli.ts add <nome>   (first user = administrator)
 # 4. point the reverse proxy to http://127.0.0.1:8080
+# Update: ./update.sh  (or: docker compose pull && docker compose up -d)
 
 services:
   g7server:
+    # Image built and tested by GitHub Actions at every push (x86 and ARM).
+    image: ghcr.io/federico-castellani/g7monitor-server:latest
+    # To build from these sources instead: docker compose up -d --build
     build: .
     restart: unless-stopped
     environment:

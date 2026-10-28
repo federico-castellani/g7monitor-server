@@ -21,6 +21,10 @@ export const SESSION_MAX = 60 * 86400;
 const TOUCH_EVERY = 300;
 const MAX_DEVICES = 20;
 const MAX_STREAMS = 100;
+/** Set at image build time (git tag or commit); "dev" when run from the sources. */
+export const VERSION = process.env.G7_VERSION || 'dev';
+/** Ping of the phones' live connection: under the usual 5-minute NAT timeouts, rarer than the readings. */
+export const DEVICE_PING_MS = 270_000;
 /** Oldest accepted reading timestamp (2020-01-01). */
 const MIN_TS = 1_577_836_800;
 
@@ -311,7 +315,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   app.setNotFoundHandler((req, reply) =>
     reply.code(404).send(req.url.startsWith('/api/') ? { error: 'non_trovato', message: 'Non trovato' } : 'Non trovato'));
 
-  app.get('/healthz', async () => ({ ok: true }));
+  app.get('/healthz', async () => ({ ok: true, version: VERSION }));
 
   // ================================================================ web: authentication and account
 
@@ -404,39 +408,58 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     return { r: store.readings(from, to) };
   });
 
-  /** Server-Sent Events: the page gets new readings as soon as the phone uploads them. */
-  app.get('/api/readings/stream', { preHandler: requireAuth }, (req, reply) => {
-    const auth = req.auth!;
-    if (hub.size >= MAX_STREAMS) return reply.code(429).send({ error: 'troppe_connessioni', message: 'Troppe connessioni aperte' });
-
+  /**
+   * Server-Sent Events: new readings are pushed as soon as the phone with the sensor uploads them.
+   * @param idlePingMs a comment line is sent only after this long without writes, so proxies and
+   *   mobile networks keep the connection open; nothing else crosses the network between readings.
+   * @param stillValid re-checked periodically: the stream ends when the session or token is revoked.
+   * @param backlog readings to send first (what a phone missed while disconnected).
+   */
+  const openStream = (
+    req: FastifyRequest, reply: FastifyReply,
+    opts: { idlePingMs: number; stillValid: () => boolean; backlog?: ReadingRow[] },
+  ) => {
     reply.hijack();
     const res = reply.raw;
     const headers: Record<string, string> = {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-store',
-      'X-Accel-Buffering': 'no',
+      'X-Accel-Buffering': 'no', // nginx: don't buffer
     };
     securityHeaders((k, v) => { headers[k] = v; }, cfg.cookieSecure);
     res.writeHead(200, headers);
-    res.write('retry: 15000\n\n');
+    let lastWrite = Date.now();
+    const write = (chunk: string) => {
+      res.write(chunk);
+      lastWrite = Date.now();
+    };
+    write('retry: 15000\n\n');
+    const send = (rows: ReadingRow[]) => write(`data: ${JSON.stringify(rows)}\n\n`);
+    const unsubscribe = hub.subscribe(send);
+    if (opts.backlog?.length) send(opts.backlog);
 
-    const unsubscribe = hub.subscribe((rows) => res.write(`data: ${JSON.stringify(rows)}\n\n`));
-    // Keeps proxies from closing the stream, and ends it when the session is revoked.
-    const ping = setInterval(() => {
-      if (!store.session(auth.tokenHash)) close();
-      else res.write(': ping\n\n');
-    }, 25_000);
+    const timer = setInterval(() => {
+      if (!opts.stillValid()) close();
+      else if (Date.now() - lastWrite >= opts.idlePingMs) write(': ping\n\n');
+    }, Math.min(opts.idlePingMs, 30_000));
     let closed = false;
     const close = () => {
       if (closed) return;
       closed = true;
-      clearInterval(ping);
+      clearInterval(timer);
       unsubscribe();
       streams.delete(close);
       res.end();
     };
     streams.add(close);
     req.raw.on('close', close);
+  };
+
+  /** The web page: browsers reconnect by themselves, a short ping keeps every proxy happy. */
+  app.get('/api/readings/stream', { preHandler: requireAuth }, (req, reply) => {
+    if (hub.size >= MAX_STREAMS) return reply.code(429).send({ error: 'troppe_connessioni', message: 'Troppe connessioni aperte' });
+    const token = req.auth!.tokenHash;
+    openStream(req, reply, { idlePingMs: 25_000, stillValid: () => !!store.session(token) });
   });
 
   // ================================================================ web: user management (admins)
@@ -550,7 +573,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   // ================================================================ app (device) API
 
   /** Public: lets the app check that an address really is a G7 Monitor server before asking for credentials. */
-  app.get('/api/v1/info', async () => ({ service: 'g7monitor', api: 1 }));
+  app.get('/api/v1/info', async () => ({ service: 'g7monitor', api: 1, version: VERSION }));
 
   /**
    * Pairs a phone: the app sends the user's credentials once and keeps only the returned token.
@@ -614,6 +637,31 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   }, async (req) => {
     const q = req.query as { since: number; limit?: number };
     return { r: store.readingsAfter(Math.max(q.since, now() - 90 * 86400), q.limit ?? 3000) };
+  });
+
+  /**
+   * Phones that receive (follower): one open connection instead of polling, so a reading arrives
+   * about a second after the sensor phone uploads it. First the readings after "since" (missed while
+   * disconnected), then each new one. Between readings the line stays silent except for a ping after
+   * [DEVICE_PING_MS] of inactivity, just enough for NAT/mobile networks not to drop it.
+   */
+  app.get('/api/v1/readings/stream', {
+    preHandler: requireDevice,
+    schema: {
+      querystring: {
+        type: 'object', required: ['since'], additionalProperties: false,
+        properties: { since: { type: 'integer', minimum: 0 } },
+      },
+    },
+  }, (req, reply) => {
+    if (hub.size >= MAX_STREAMS) return reply.code(429).send({ error: 'troppe_connessioni', message: 'Troppe connessioni aperte' });
+    const { since } = req.query as { since: number };
+    const deviceId = req.deviceId!;
+    openStream(req, reply, {
+      idlePingMs: DEVICE_PING_MS,
+      stillValid: () => store.deviceExists(deviceId),
+      backlog: store.readingsAfter(Math.max(since, now() - 90 * 86400), 3000),
+    });
   });
 
   app.post('/api/v1/readings', {

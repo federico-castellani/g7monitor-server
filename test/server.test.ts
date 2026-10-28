@@ -391,7 +391,7 @@ describe('upload', () => {
 
   test('public info lets the app recognise the server', async () => {
     const res = await app.inject({ url: '/api/v1/info' });
-    assert.deepEqual(res.json(), { service: 'g7monitor', api: 1 });
+    assert.deepEqual(res.json(), { service: 'g7monitor', api: 1, version: 'dev' });
   });
 
   test('follower polling returns only newer readings, oldest first', async () => {
@@ -404,5 +404,59 @@ describe('upload', () => {
   test('large responses are compressed', async () => {
     const res = await app.inject({ url: `/api/readings?from=${base - 90000}`, headers: { cookie, 'accept-encoding': 'br, gzip' } });
     assert.equal(res.headers['content-encoding'], 'br');
+  });
+});
+
+// ------------------------------------------------------------------ live stream for phones
+
+describe('live stream', () => {
+  test('a follower phone gets the missed readings, then each new one as soon as it is uploaded', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'fede', 'admin');
+    await addUser(store, 'ospite');
+    const uploader = await pair(app, 'fede');
+    const readerRes = await app.inject({ method: 'POST', url: '/api/v1/devices', payload: { username: 'ospite', password: PASSWORD, name: 'Telefono', kind: 'reader' } });
+    const reader = readerRes.json().token as string;
+    const t = Math.floor(Date.now() / 1000) - 900;
+    const upload = (b: number, mgdl: number) => app.inject({
+      method: 'POST', url: '/api/v1/readings', headers: { authorization: `Bearer ${uploader}` }, payload: { b, r: [[0, mgdl, 0, 0]] },
+    });
+    await upload(t, 111); // uploaded while the follower was offline
+
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const abort = new AbortController();
+    try {
+      assert.equal((await fetch(`${address}/api/v1/readings/stream?since=0`)).status, 401);
+      const res = await fetch(`${address}/api/v1/readings/stream?since=${t - 60}`, {
+        headers: { authorization: `Bearer ${reader}` }, signal: abort.signal,
+      });
+      assert.equal(res.status, 200);
+      assert.match(String(res.headers.get('content-type')), /text\/event-stream/);
+      const reader$ = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      const nextData = async () => {
+        for (;;) {
+          const i = buffer.indexOf('data: ');
+          const end = i >= 0 ? buffer.indexOf('\n\n', i) : -1;
+          if (end >= 0) {
+            const json = buffer.slice(i + 6, end);
+            buffer = buffer.slice(end + 2);
+            return JSON.parse(json);
+          }
+          const { value, done } = await reader$.read();
+          if (done) throw new Error('stream closed');
+          buffer += decoder.decode(value, { stream: true });
+        }
+      };
+      assert.deepEqual(await nextData(), [[t, 111, 0, 0]]); // backlog
+      const started = Date.now();
+      await upload(t + 300, 122);
+      assert.deepEqual(await nextData(), [[t + 300, 122, 0, 0]]); // pushed live
+      assert.ok(Date.now() - started < 1000);
+    } finally {
+      abort.abort();
+      await app.close();
+    }
   });
 });
