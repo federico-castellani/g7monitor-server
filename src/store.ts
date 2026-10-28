@@ -36,6 +36,8 @@ const USER_LOCK_AFTER = 5;
 /** Per IP: at most this many failed logins in [IP_WINDOW] seconds. */
 export const IP_MAX_FAILURES = 20;
 const IP_WINDOW = 15 * 60;
+/** Readings closer than this (seconds) are the same reading (sensor period: 300 s). */
+export const DUPLICATE_WINDOW = 120;
 
 type Row = Record<string, unknown>;
 const num = (v: unknown): number | null => (v == null ? null : Number(v));
@@ -266,10 +268,22 @@ export class Store {
 
   // ------------------------------------------------------------------ readings
 
-  /** Inserts in one transaction, ignoring rows already present. @return the rows that were new. */
+  /**
+   * Inserts in one transaction, skipping readings already stored. A reading counts as already
+   * stored when another one lies within ±[DUPLICATE_WINDOW] seconds: the phone computes the time
+   * of a reading when it receives it, so the same reading sent again (live, then from the sensor's
+   * backfill after a reset, or by a second phone) can differ by a second or two. The G7 reads every
+   * 5 minutes, so two genuine readings are never that close.
+   * @return the rows that were new.
+   */
   insertReadings(rows: ReadingRow[]): ReadingRow[] {
-    const ins = this.q('INSERT OR IGNORE INTO readings (ts, mgdl, trend, source) VALUES (?, ?, ?, ?)');
-    return this.transaction(() => rows.filter(([ts, mgdl, trend, src]) => Number(ins.run(ts, mgdl, trend, src).changes) > 0));
+    const near = this.q('SELECT 1 FROM readings WHERE ts BETWEEN ? AND ? LIMIT 1');
+    const ins = this.q('INSERT INTO readings (ts, mgdl, trend, source) VALUES (?, ?, ?, ?)');
+    return this.transaction(() => rows.filter(([ts, mgdl, trend, src]) => {
+      if (near.get(ts - DUPLICATE_WINDOW, ts + DUPLICATE_WINDOW)) return false;
+      ins.run(ts, mgdl, trend, src);
+      return true;
+    }));
   }
 
   readings(from: number, to: number): ReadingRow[] {

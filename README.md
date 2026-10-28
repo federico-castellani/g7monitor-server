@@ -51,6 +51,12 @@ Il telefono non tiene una connessione sempre aperta, che sveglierebbe la radio o
 - **Un'unica richiesta** con tutte le letture in attesa, comprese quelle recuperate dal backfill. Il formato è `[secondi dal precedente, mg/dL, tendenza×10, origine]`, circa **15 byte per lettura**: una giornata intera pesa circa 4 KB, poco più di 1 KB con gzip.
 - **Frequenza regolabile** (5, 15, 30 o 60 minuti) e opzione **solo Wi-Fi**.
 - **Pausa crescente in caso di errore**: se manca la rete o il server non risponde, i tentativi si diradano fino a uno all'ora. Le letture restano sul telefono e partono tutte insieme appena possibile.
+- **Nessun doppione**: il server considera già presente una lettura se ne ha un'altra entro ±2 minuti. Il G7 legge ogni 5 minuti, quindi due letture vere non sono mai così vicine. Così il telefono può reinviare senza problemi:
+  - dopo un reset o un nuovo collegamento, ricarica tutto ciò che ha in locale;
+  - dopo un errore di rete;
+  - se due telefoni caricano lo stesso sensore.
+
+  Lo stesso controllo copre la stessa lettura arrivata prima in diretta e poi dal backfill del sensore, con un'ora diversa di qualche secondo perché calcolata al momento della ricezione.
 
 ## Avvio in locale
 

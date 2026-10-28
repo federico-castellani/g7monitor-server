@@ -340,6 +340,20 @@ describe('upload', () => {
     assert.deepEqual((await web(app, guest, 'GET', `/api/readings?from=${base - 10}`)).json().r, expected);
   });
 
+  test('the same reading sent again with a slightly different time is not duplicated', async () => {
+    const t = base - 2 * 86400; // away from the other tests' readings
+    assert.equal((await upload({ b: t, r: [[0, 140, 0, 0]] })).json().n, 1);
+    // after a phone reset the backfill recomputes the time: a couple of seconds off
+    assert.equal((await upload({ b: t + 2, r: [[0, 140, 0, 1]] })).json().n, 0);
+    assert.equal((await upload({ b: t - 90, r: [[0, 140, 0, 1]] })).json().n, 0);
+    // two rows of the same batch that are the same reading
+    assert.equal((await upload({ b: t + 300, r: [[0, 150, 0, 1], [40, 150, 0, 0]] })).json().n, 1);
+    // the next genuine reading, 5 minutes later, is kept
+    assert.equal((await upload({ b: t + 600, r: [[0, 160, 0, 0]] })).json().n, 1);
+    const stored = store.readings(t - 300, t + 900);
+    assert.deepEqual(stored.map((r) => r[0]), [t, t + 300, t + 600]);
+  });
+
   test('accepts the exact body produced by the Android app (ServerApiTest.kt)', async () => {
     const body = '{"b":1761660000,"r":[[0,110,5,0],[300,118,null,1],[300,39,null,0],[301,401,-250,0]]}';
     const res = await upload(body);
