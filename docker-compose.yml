@@ -9,7 +9,7 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      G7_ORIGIN: https://${G7_DOMAIN:?imposta G7_DOMAIN nel file .env}
+      G7_ORIGIN: ${G7_DOMAIN:?imposta G7_DOMAIN nel file .env} # with or without https://
       G7_TRUST_PROXY: "true" # the port is published on localhost only: every request comes from the proxy
       G7_PEPPER: ${G7_PEPPER:-}
     ports:

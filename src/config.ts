@@ -17,11 +17,31 @@ function bool(v: string | undefined, def: boolean): boolean {
   return ['1', 'true', 'yes', 'si'].includes(v.toLowerCase());
 }
 
+/**
+ * Accepts "glicemie.example.com", "https://glicemie.example.com/", quotes, spaces and a
+ * doubled scheme (G7_DOMAIN written with https:// in docker-compose): returns the bare origin.
+ */
+export function normalizeOrigin(raw: string | undefined): string | null {
+  let v = (raw ?? '').trim().replace(/^["']|["']$/g, '').trim();
+  if (!v) return null;
+  v = v.replace(/^(https?:\/\/)+(https?:\/\/)/i, '$2');
+  if (!/^https?:\/\//i.test(v)) v = `https://${v}`;
+  let url: URL;
+  try {
+    url = new URL(v);
+  } catch {
+    throw new Error(`G7_ORIGIN non valido: "${raw}" (es. https://glicemie.example.com)`);
+  }
+  if (url.pathname.replace(/\/+$/, '') !== '' || url.search || url.hash || url.username) {
+    throw new Error(`G7_ORIGIN deve essere solo l'indirizzo, senza percorsi: "${raw}" (es. https://glicemie.example.com)`);
+  }
+  return url.origin;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const pepper = env.G7_PEPPER ?? '';
   if (pepper && pepper.length < 32) throw new Error('G7_PEPPER deve avere almeno 32 caratteri');
-  const origin = env.G7_ORIGIN?.replace(/\/+$/, '') || null;
-  if (origin && !/^https?:\/\/[^/]+$/.test(origin)) throw new Error('G7_ORIGIN non valido (es. https://glicemie.example.com)');
+  const origin = normalizeOrigin(env.G7_ORIGIN);
   const trust = env.G7_TRUST_PROXY ?? '';
   return {
     host: env.G7_HOST || '127.0.0.1',

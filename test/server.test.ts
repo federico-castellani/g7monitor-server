@@ -3,6 +3,7 @@ import { gzipSync } from 'node:zlib';
 import { before, describe, test } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.ts';
+import { normalizeOrigin } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
 import { openDb } from '../src/db.ts';
 import { Store } from '../src/store.ts';
@@ -49,6 +50,22 @@ async function pair(app: FastifyInstance, username: string): Promise<string> {
 /** Browser call with session cookie and same-origin header. */
 const web = (app: FastifyInstance, cookie: string, method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, payload?: object) =>
   app.inject({ method, url, headers: { cookie, origin: ORIGIN }, ...(payload ? { payload } : {}) });
+
+// ------------------------------------------------------------------ config
+
+describe('config', () => {
+  test('G7_ORIGIN accepts the usual ways of writing the domain', () => {
+    for (const v of ['glicemie.example.com', 'https://glicemie.example.com', 'https://glicemie.example.com/',
+      ' "https://glicemie.example.com" ', 'https://https://glicemie.example.com', 'HTTPS://Glicemie.Example.com']) {
+      assert.equal(normalizeOrigin(v), 'https://glicemie.example.com', v);
+    }
+    assert.equal(normalizeOrigin('http://192.168.1.10:8080'), 'http://192.168.1.10:8080');
+    assert.equal(normalizeOrigin('https://g7.example.com:8443'), 'https://g7.example.com:8443');
+    assert.equal(normalizeOrigin(''), null);
+    assert.equal(normalizeOrigin(undefined), null);
+    assert.throws(() => normalizeOrigin('https://glicemie.example.com/app'), /senza percorsi/);
+  });
+});
 
 // ------------------------------------------------------------------ crypto
 
