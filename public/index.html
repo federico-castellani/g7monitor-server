@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f4f6f8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0e1216" media="(prefers-color-scheme: dark)">
+  <title>G7 Monitor</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+
+<main id="login" class="login" hidden>
+  <form id="login-form" class="card login-card">
+    <div class="brand brand-lg"><img src="/favicon.svg" alt="" width="44" height="44"><h1>G7 Monitor</h1></div>
+    <label class="field">
+      <span>Nome utente</span>
+      <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="64" required>
+    </label>
+    <label class="field">
+      <span>Password</span>
+      <input name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+    </label>
+    <label class="field" id="totp-field" hidden>
+      <span>Codice di verifica</span>
+      <input name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6 cifre">
+    </label>
+    <p id="login-error" class="error" role="alert"></p>
+    <button type="submit" class="btn primary">Accedi</button>
+  </form>
+  <p class="disclaimer">Non è un dispositivo medico: per decisioni terapeutiche usa un dispositivo approvato.</p>
+</main>
+
+<main id="force-pw" class="login" hidden>
+  <form id="force-pw-form" class="card login-card">
+    <div class="brand brand-lg"><img src="/favicon.svg" alt="" width="44" height="44"><h1>Nuova password</h1></div>
+    <p class="muted small">La password che hai ricevuto è temporanea: scegline una tua per continuare.</p>
+    <input type="text" name="username" autocomplete="username" hidden>
+    <label class="field"><span>Password temporanea</span><input name="current" type="password" autocomplete="current-password" required></label>
+    <label class="field"><span>Nuova password (almeno 12 caratteri)</span><input name="next" type="password" autocomplete="new-password" minlength="12" required></label>
+    <label class="field"><span>Ripeti la nuova password</span><input name="again" type="password" autocomplete="new-password" minlength="12" required></label>
+    <p class="error" id="force-pw-msg" role="alert"></p>
+    <button type="submit" class="btn primary">Salva e continua</button>
+    <button type="button" class="btn" id="force-pw-logout">Esci</button>
+  </form>
+</main>
+
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <div class="brand"><img src="/favicon.svg" alt="" width="28" height="28"><span>G7 Monitor</span></div>
+    <div class="spacer"></div>
+    <span id="live" class="live" title="Aggiornamento in tempo reale"><i></i><span>Live</span></span>
+    <button id="open-users" class="icon-btn" type="button" aria-label="Gestione utenti" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm0 2c-3.3 0-7 1.7-7 4.2V20h14v-1.8C16 15.7 12.3 14 9 14Zm7.5-2.2a3.3 3.3 0 1 0-.9-6.4 5.9 5.9 0 0 1 0 5.6c.3.5.6.8.9.8Zm1.3 2.4c1.4.9 2.2 2.1 2.2 3.9V20h2v-1.8c0-1.9-1.9-3.3-4.2-4Z"/></svg>
+    </button>
+    <button id="open-settings" class="icon-btn" type="button" aria-label="Impostazioni">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm7.4-2.5a7.6 7.6 0 0 0 0-2l2.1-1.6-2-3.4-2.5 1a7.4 7.4 0 0 0-1.7-1L15 3.4h-4l-.4 2.6a7.4 7.4 0 0 0-1.7 1l-2.5-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6 2 3.4 2.5-1a7.4 7.4 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.4 7.4 0 0 0 1.7-1l2.5 1 2-3.4-2.1-1.6Z"/></svg>
+    </button>
+  </header>
+
+  <main class="content">
+    <section class="card hero" id="hero">
+      <div class="hero-main">
+        <div class="value"><span id="cur-value">––</span><span id="cur-arrow" class="arrow"></span></div>
+        <div class="unit" id="cur-unit">mg/dL</div>
+      </div>
+      <div class="hero-side">
+        <div class="pill" id="cur-trend"></div>
+        <div class="pill" id="cur-delta"></div>
+        <div class="pill" id="cur-ago"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Andamento</h2>
+        <div class="seg" id="window" role="group" aria-label="Intervallo del grafico">
+          <button type="button" data-h="3">3h</button>
+          <button type="button" data-h="6">6h</button>
+          <button type="button" data-h="12">12h</button>
+          <button type="button" data-h="24">24h</button>
+          <button type="button" data-h="168">7g</button>
+        </div>
+      </div>
+      <div id="chart" class="chart" role="img" aria-label="Grafico della glicemia"><div id="tip" class="tip" hidden></div></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Statistiche</h2><span class="muted" id="stats-span"></span></div>
+      <div class="tir" id="tir" aria-label="Tempo nei range">
+        <div class="tir-bar"><i class="low"></i><i class="in"></i><i class="high"></i></div>
+        <div class="tir-legend">
+          <span><i class="dot low"></i>Sotto <b id="tir-low">–</b></span>
+          <span><i class="dot in"></i>In target <b id="tir-in">–</b></span>
+          <span><i class="dot high"></i>Sopra <b id="tir-high">–</b></span>
+        </div>
+      </div>
+      <div class="tiles">
+        <div class="tile"><span>Media</span><b id="st-avg">–</b></div>
+        <div class="tile"><span>GMI stimato</span><b id="st-gmi">–</b></div>
+        <div class="tile"><span>Variabilità (CV)</span><b id="st-cv">–</b></div>
+        <div class="tile"><span>Letture</span><b id="st-n">–</b></div>
+      </div>
+    </section>
+
+    <p class="disclaimer">Non è un dispositivo medico: per decisioni terapeutiche usa un dispositivo approvato.</p>
+  </main>
+</div>
+
+<dialog id="settings" class="sheet" aria-labelledby="settings-title">
+  <div class="sheet-head">
+    <h2 id="settings-title">Impostazioni</h2>
+    <button type="button" class="icon-btn" id="close-settings" aria-label="Chiudi">✕</button>
+  </div>
+
+  <section class="group">
+    <h3>Visualizzazione</h3>
+    <div class="row">
+      <span>Unità</span>
+      <div class="seg" id="unit-seg">
+        <button type="button" data-unit="mgdl">mg/dL</button>
+        <button type="button" data-unit="mmol">mmol/L</button>
+      </div>
+    </div>
+    <div class="row">
+      <span>Intervallo target (mg/dL)</span>
+      <div class="range-inputs">
+        <input id="range-low" type="number" min="54" max="120" step="1" aria-label="Limite basso">
+        <span>–</span>
+        <input id="range-high" type="number" min="120" max="300" step="1" aria-label="Limite alto">
+      </div>
+    </div>
+  </section>
+
+  <section class="group">
+    <h3>Account</h3>
+    <p class="muted small" id="account-info"></p>
+  </section>
+
+  <section class="group" id="devices-group">
+    <h3>Telefoni collegati</h3>
+    <p class="muted small" id="devices-help">Il telefono si collega dall'app G7 Monitor (Impostazioni → Server). Rimuovilo qui se lo perdi.</p>
+    <ul class="list" id="devices"></ul>
+  </section>
+
+  <section class="group">
+    <h3>Sicurezza</h3>
+    <p class="muted small" id="twofa"></p>
+    <form id="pw-form" class="stack">
+      <input type="text" name="username" autocomplete="username" hidden>
+      <label class="field"><span>Password attuale</span><input name="current" type="password" autocomplete="current-password" required></label>
+      <label class="field"><span>Nuova password (almeno 12 caratteri)</span><input name="next" type="password" autocomplete="new-password" minlength="12" required></label>
+      <label class="field"><span>Ripeti la nuova password</span><input name="again" type="password" autocomplete="new-password" minlength="12" required></label>
+      <p class="error" id="pw-msg" role="status"></p>
+      <button type="submit" class="btn">Cambia password</button>
+    </form>
+    <button type="button" class="btn danger-outline" id="logout-all">Esci da tutti i browser</button>
+  </section>
+
+  <section class="group">
+    <h3>Attività recente</h3>
+    <ul class="list compact" id="activity"></ul>
+  </section>
+
+  <button type="button" class="btn danger" id="logout">Esci</button>
+</dialog>
+
+<dialog id="users" class="sheet" aria-labelledby="users-title">
+  <div class="sheet-head">
+    <h2 id="users-title">Utenti</h2>
+    <button type="button" class="icon-btn" id="close-users" aria-label="Chiudi">✕</button>
+  </div>
+  <p class="muted small">
+    Tutti gli utenti vedono le glicemie. Gli <b>amministratori</b> possono anche caricarle e gestire gli utenti;
+    un <b>utente</b> può caricarle solo se glielo consenti.
+  </p>
+  <p class="error" id="users-msg" role="status"></p>
+  <ul class="list users" id="user-list"></ul>
+
+  <section class="group">
+    <h3>Nuovo utente</h3>
+    <form id="new-user" class="stack" autocomplete="off">
+      <label class="field"><span>Nome utente</span><input name="username" pattern="[a-zA-Z0-9._\-]{3,32}" maxlength="32" autocapitalize="none" spellcheck="false" required></label>
+      <label class="field"><span>Password temporanea (dovrà cambiarla al primo accesso)</span>
+        <span class="input-row"><input name="password" type="text" minlength="12" required autocomplete="off" spellcheck="false"><button type="button" class="btn small" id="gen-pw">Genera</button></span>
+      </label>
+      <div class="row">
+        <span>Ruolo</span>
+        <select name="role" class="compact-select"><option value="user">Utente</option><option value="admin">Amministratore</option></select>
+      </div>
+      <label class="check"><input type="checkbox" name="canWrite"> Può caricare glicemie (collegare un telefono)</label>
+      <button type="submit" class="btn primary">Crea utente</button>
+    </form>
+  </section>
+</dialog>
+
+</body>
+</html>

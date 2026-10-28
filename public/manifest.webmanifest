@@ -1,0 +1,9 @@
+{
+  "name": "G7 Monitor",
+  "short_name": "G7 Monitor",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0e1216",
+  "theme_color": "#1f9d62",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

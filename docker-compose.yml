@@ -1,0 +1,28 @@
+# G7 Monitor server, behind your own reverse proxy (which handles TLS).
+# 1. cp .env.example .env and fill it in
+# 2. docker compose up -d --build
+# 3. docker compose exec g7server node src/cli.ts add <nome>   (first user = administrator)
+# 4. point the reverse proxy to http://127.0.0.1:8080
+
+services:
+  g7server:
+    build: .
+    restart: unless-stopped
+    environment:
+      G7_ORIGIN: https://${G7_DOMAIN:?imposta G7_DOMAIN nel file .env}
+      G7_TRUST_PROXY: "true" # the port is published on localhost only: every request comes from the proxy
+      G7_PEPPER: ${G7_PEPPER:-}
+    ports:
+      - "127.0.0.1:${G7_PORT:-8080}:8080"
+    volumes:
+      - g7data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  g7data:

@@ -1,0 +1,657 @@
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
+import { extname, join } from 'node:path';
+import type { Readable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
+import { brotliCompressSync, constants as zc, createGunzip, gzipSync } from 'node:zlib';
+import Fastify from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { Config } from './config.ts';
+import { USERNAME_RE, mayWrite, now } from './store.ts';
+import type { DeviceKind, ReadingRow, Role, Store, User } from './store.ts';
+import { authenticate } from './auth.ts';
+import type { Credentials } from './auth.ts';
+import { hashPassword, passwordProblem, verifyPassword } from './security/password.ts';
+import { DEVICE_TOKEN_PREFIX, DEVICE_TOKEN_RE, SESSION_TOKEN_RE, newToken, sha256 } from './security/tokens.ts';
+
+/** A browser session ends after 14 days without use, and in any case after 60 days. */
+export const SESSION_IDLE = 14 * 86400;
+export const SESSION_MAX = 60 * 86400;
+/** last_seen is written at most this often, to avoid a database write per request. */
+const TOUCH_EVERY = 300;
+const MAX_DEVICES = 20;
+const MAX_STREAMS = 100;
+/** Oldest accepted reading timestamp (2020-01-01). */
+const MIN_TS = 1_577_836_800;
+
+
+interface Auth { tokenHash: Buffer; user: User }
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    auth: Auth | null;
+    deviceId: number | null;
+    deviceUser: number | null;
+    deviceKind: DeviceKind | null;
+  }
+}
+
+// ---------------------------------------------------------------------- live updates
+
+type Listener = (rows: ReadingRow[]) => void;
+
+/** In-process fan-out of new readings to the open SSE streams. */
+class Hub {
+  private listeners = new Set<Listener>();
+
+  subscribe(l: Listener): () => void {
+    this.listeners.add(l);
+    return () => this.listeners.delete(l);
+  }
+
+  get size(): number {
+    return this.listeners.size;
+  }
+
+  publish(rows: ReadingRow[]): void {
+    if (rows.length) this.listeners.forEach((l) => l(rows));
+  }
+}
+
+// ---------------------------------------------------------------------- HTTP helpers
+
+const CSP = [
+  "default-src 'none'", "script-src 'self'", "style-src 'self'", "img-src 'self' data:",
+  "connect-src 'self'", "manifest-src 'self'", "base-uri 'none'", "form-action 'self'", "frame-ancestors 'none'",
+].join('; ');
+
+function securityHeaders(set: (name: string, value: string) => void, https: boolean): void {
+  set('Content-Security-Policy', CSP);
+  set('X-Content-Type-Options', 'nosniff');
+  set('X-Frame-Options', 'DENY');
+  set('Referrer-Policy', 'no-referrer');
+  set('Cross-Origin-Opener-Policy', 'same-origin');
+  set('Cross-Origin-Resource-Policy', 'same-origin');
+  set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()');
+  if (https) set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+}
+
+function pickEncoding(accept: string | undefined): 'br' | 'gzip' | null {
+  if (!accept) return null;
+  const tokens = accept.toLowerCase().split(',').map((s) => s.trim());
+  const has = (e: string) => tokens.some((t) => t === e || (t.startsWith(e + ';') && !/q=0(\.0*)?$/.test(t)));
+  return has('br') ? 'br' : has('gzip') ? 'gzip' : null;
+}
+
+function readCookie(req: FastifyRequest, name: string): string | null {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+
+interface StaticFile { type: string; etag: string; raw: Buffer; br: Buffer; gz: Buffer }
+
+const TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.webmanifest': 'application/manifest+json',
+};
+
+/** The web UI is a handful of small files: loaded and pre-compressed once at startup. */
+function loadStatic(dir: string): Map<string, StaticFile> {
+  const files = new Map<string, StaticFile>();
+  for (const name of readdirSync(dir)) {
+    const type = TYPES[extname(name)];
+    if (!type) continue;
+    const raw = readFileSync(join(dir, name));
+    files.set(name, {
+      type,
+      raw,
+      etag: `"${createHash('sha256').update(raw).digest('base64url').slice(0, 22)}"`,
+      br: brotliCompressSync(raw, { params: { [zc.BROTLI_PARAM_QUALITY]: 11 } }),
+      gz: gzipSync(raw, { level: 9 }),
+    });
+  }
+  return files;
+}
+
+/** Decompresses gzip uploads; the body limit then applies to the decompressed size (no zip bombs). */
+async function gunzipBody(req: FastifyRequest, _reply: FastifyReply, payload: Readable): Promise<Readable> {
+  const enc = req.headers['content-encoding'];
+  if (!enc || enc === 'identity') return payload;
+  if (enc !== 'gzip') throw Object.assign(new Error('Codifica non supportata'), { statusCode: 415 });
+  const gunzip = createGunzip();
+  let received = 0;
+  payload.on('data', (chunk: Buffer) => {
+    received += chunk.length;
+    // lets Fastify compare Content-Length with the compressed bytes actually received
+    (gunzip as Readable & { receivedEncodedLength?: number }).receivedEncodedLength = received;
+  });
+  payload.on('error', (e) => gunzip.destroy(e));
+  return payload.pipe(gunzip);
+}
+
+/**
+ * Upload format, designed to be tiny: {"b": base time, "r": [[dt, mgdl, trend×10|null, source], …]}
+ * where dt is seconds from the previous row (the first from b). A 5-minute series
+ * becomes mostly "[300,123,-4,0]": about 15 bytes per reading before gzip.
+ */
+function decodeRows(b: number, rows: unknown[]): ReadingRow[] | string {
+  const out: ReadingRow[] = [];
+  const maxTs = now() + 600;
+  let ts = b;
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length !== 4) return 'riga non valida';
+    const [dt, mgdl, trend, src] = row as unknown[];
+    if (!Number.isInteger(dt) || (dt as number) < 0 || (dt as number) > 90 * 86400) return 'intervallo di tempo non valido';
+    ts += dt as number;
+    if (ts > maxTs) return 'orario nel futuro';
+    if (!Number.isInteger(mgdl) || (mgdl as number) < 39 || (mgdl as number) > 401) return 'glicemia fuori intervallo';
+    if (trend !== null && (!Number.isInteger(trend) || (trend as number) < -250 || (trend as number) > 250)) return 'tendenza non valida';
+    if (src !== 0 && src !== 1) return 'origine non valida';
+    out.push([ts, mgdl as number, trend as number | null, src]);
+  }
+  return out;
+}
+
+/** What the browser may know about an account. */
+function publicUser(u: User) {
+  return {
+    id: u.id,
+    username: u.username,
+    role: u.role,
+    canWrite: mayWrite(u),
+    mustChangePassword: u.mustChangePassword,
+    totp: !!u.totpSecret,
+  };
+}
+
+// ---------------------------------------------------------------------- schemas
+
+const credentialsProps = {
+  username: { type: 'string', minLength: 1, maxLength: 64 },
+  password: { type: 'string', minLength: 1, maxLength: 1024 },
+  totp: { type: 'string', pattern: '^[0-9]{6}$' },
+} as const;
+
+const idParams = {
+  type: 'object', required: ['id'], properties: { id: { type: 'integer', minimum: 1 } },
+} as const;
+
+// ---------------------------------------------------------------------- app
+
+export interface AppOptions { logger?: boolean; publicDir?: string }
+
+export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): FastifyInstance {
+  const app = Fastify({
+    logger: opts.logger === false ? false : {
+      level: 'info',
+      redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers["set-cookie"]'],
+    },
+    trustProxy: cfg.trustProxy,
+    bodyLimit: 16 * 1024,
+    return503OnClosing: true,
+  });
+
+  const hub = new Hub();
+  const streams = new Set<() => void>();
+  const cookieName = cfg.cookieSecure ? '__Host-g7s' : 'g7s';
+  const sessionCookie = (token: string, maxAge: number) =>
+    `${cookieName}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${cfg.cookieSecure ? '; Secure' : ''}`;
+  const isBrowserApi = (url: string) => url.startsWith('/api/') && !url.startsWith('/api/v1/');
+  const forbidden = (reply: FastifyReply, error: string, message: string) => reply.code(403).send({ error, message });
+
+  app.decorateRequest('auth', null);
+  app.decorateRequest('deviceId', null);
+  app.decorateRequest('deviceUser', null);
+  app.decorateRequest('deviceKind', null);
+
+  // ----- browser session + CSRF protection
+  app.addHook('onRequest', async (req, reply) => {
+    if (!isBrowserApi(req.url)) return;
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      // Besides SameSite=Strict cookies: state-changing calls only from our own pages.
+      const expected = cfg.publicOrigin ?? `${req.protocol}://${req.host}`;
+      const site = req.headers['sec-fetch-site'];
+      if (req.headers.origin !== expected || (site !== undefined && site !== 'same-origin')) {
+        return forbidden(reply, 'origine_non_valida', 'Richiesta non consentita');
+      }
+    }
+    const token = readCookie(req, cookieName);
+    if (!token || !SESSION_TOKEN_RE.test(token)) return;
+    const hash = sha256(token);
+    const s = store.session(hash);
+    if (!s) return;
+    const t = now();
+    if (s.lastSeen < t - SESSION_IDLE || s.createdAt < t - SESSION_MAX) {
+      store.deleteSession(hash);
+      return;
+    }
+    // Loaded on every request: role and permission changes apply immediately.
+    const user = store.userById(s.userId);
+    if (!user) return;
+    req.auth = { tokenHash: hash, user };
+    if (t - s.lastSeen > TOUCH_EVERY) store.touchSession(hash);
+  });
+
+  /** Until a temporary password is replaced, only these calls are allowed. */
+  const ALLOWED_BEFORE_PASSWORD_CHANGE = new Set(['/api/me', '/api/me/password', '/api/auth/logout']);
+
+  const requireAuth = async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!req.auth) return reply.code(401).send({ error: 'non_autenticato', message: 'Accesso richiesto' });
+    if (req.auth.user.mustChangePassword && !ALLOWED_BEFORE_PASSWORD_CHANGE.has(req.routeOptions.url ?? '')) {
+      return forbidden(reply, 'cambio_password_richiesto', 'Prima di continuare scegli una nuova password');
+    }
+  };
+
+  const requireAdmin = async (req: FastifyRequest, reply: FastifyReply) => {
+    const refused = await requireAuth(req, reply);
+    if (refused) return refused;
+    if (req.auth!.user.role !== 'admin') return forbidden(reply, 'solo_amministratori', 'Funzione riservata agli amministratori');
+  };
+
+  /** Phone token of any kind: enough to read, since every account can see the readings. */
+  const requireDevice = async (req: FastifyRequest, reply: FastifyReply) => {
+    const m = /^Bearer (\S+)$/.exec(req.headers.authorization ?? '');
+    const device = m && DEVICE_TOKEN_RE.test(m[1]) ? store.deviceByToken(sha256(m[1])) : null;
+    if (!device) return reply.code(401).send({ error: 'token_non_valido', message: 'Dispositivo non autorizzato' });
+    req.deviceId = device.id;
+    req.deviceUser = device.userId;
+    req.deviceKind = device.kind;
+    store.touchDevice(device.id, req.ip);
+  };
+
+  /** Upload token of an account allowed to write: checked on every request, so revoking the permission is immediate. */
+  const requireUploader = async (req: FastifyRequest, reply: FastifyReply) => {
+    const refused = await requireDevice(req, reply);
+    if (refused) return refused;
+    if (req.deviceKind !== 'uploader') return forbidden(reply, 'token_di_sola_lettura', 'Questo telefono è collegato solo per ricevere le glicemie');
+    if (!mayWrite(store.userById(req.deviceUser!)!)) {
+      return forbidden(reply, 'scrittura_non_consentita', 'Il tuo account può solo leggere: chiedi a un amministratore il permesso di caricare');
+    }
+  };
+
+  // ----- security headers + compression of dynamic responses
+  app.addHook('onSend', async (req, reply, payload) => {
+    securityHeaders((k, v) => reply.header(k, v), cfg.cookieSecure);
+    if (req.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
+    if ((typeof payload !== 'string' && !Buffer.isBuffer(payload)) || reply.hasHeader('content-encoding')) return payload;
+    const type = String(reply.getHeader('content-type') ?? '');
+    if (Buffer.byteLength(payload) < 1024 || !/json|text/.test(type)) return payload;
+    reply.header('Vary', 'Accept-Encoding');
+    const enc = pickEncoding(req.headers['accept-encoding']);
+    if (!enc) return payload;
+    reply.header('Content-Encoding', enc);
+    reply.removeHeader('content-length');
+    return enc === 'br'
+      ? brotliCompressSync(payload, { params: { [zc.BROTLI_PARAM_QUALITY]: 5 } })
+      : gzipSync(payload, { level: 6 });
+  });
+
+  app.addHook('preClose', async () => {
+    for (const close of [...streams]) close();
+  });
+
+  app.setErrorHandler((err: Error & { statusCode?: number; validation?: unknown }, req, reply) => {
+    if (err.validation) return reply.code(400).send({ error: 'richiesta_non_valida', message: 'Dati non validi' });
+    const status = err.statusCode && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 500;
+    if (status === 500) req.log.error(err);
+    return reply.code(status).send({
+      error: status === 413 ? 'troppo_grande' : status === 500 ? 'errore_interno' : 'richiesta_non_valida',
+      message: status === 500 ? 'Errore interno del server' : err.message,
+    });
+  });
+
+  app.setNotFoundHandler((req, reply) =>
+    reply.code(404).send(req.url.startsWith('/api/') ? { error: 'non_trovato', message: 'Non trovato' } : 'Non trovato'));
+
+  app.get('/healthz', async () => ({ ok: true }));
+
+  // ================================================================ web: authentication and account
+
+  app.post('/api/auth/login', {
+    schema: { body: { type: 'object', required: ['username', 'password'], additionalProperties: false, properties: credentialsProps } },
+  }, async (req, reply) => {
+    const r = await authenticate(store, cfg.pepper, req.body as Credentials, req.ip);
+    if (!r.ok) return reply.code(r.status).send({ error: r.error, message: r.message });
+    if (req.auth) store.deleteSession(req.auth.tokenHash); // never reuse a session id across logins
+    const token = newToken();
+    const ua = String(req.headers['user-agent'] ?? '');
+    store.createSession(sha256(token), r.user.id, req.ip, ua);
+    store.audit(r.user.id, 'accesso_web', req.ip, ua.slice(0, 120));
+    reply.header('Set-Cookie', sessionCookie(token, SESSION_MAX));
+    return publicUser(r.user);
+  });
+
+  app.post('/api/auth/logout', async (req, reply) => {
+    if (req.auth) store.deleteSession(req.auth.tokenHash);
+    reply.header('Set-Cookie', sessionCookie('', 0));
+    return reply.code(204).send();
+  });
+
+  app.get('/api/me', { preHandler: requireAuth }, async (req) => publicUser(req.auth!.user));
+
+  app.post('/api/me/password', {
+    preHandler: requireAuth,
+    schema: {
+      body: {
+        type: 'object', required: ['current', 'next'], additionalProperties: false,
+        properties: { current: { type: 'string', maxLength: 1024 }, next: { type: 'string', maxLength: 1024 } },
+      },
+    },
+  }, async (req, reply) => {
+    const { current, next } = req.body as { current: string; next: string };
+    const u = req.auth!.user;
+    if (store.ipBlocked(req.ip)) return reply.code(429).send({ error: 'troppi_tentativi', message: 'Troppi tentativi: riprova tra qualche minuto' });
+    if (!(await verifyPassword(u.passwordHash, current, cfg.pepper)).ok) {
+      store.recordIpFailure(req.ip);
+      store.audit(u.id, 'cambio_password_fallito', req.ip);
+      return reply.code(400).send({ error: 'password_errata', message: 'La password attuale non è corretta' });
+    }
+    if (next === current) return reply.code(400).send({ error: 'password_uguale', message: 'La nuova password deve essere diversa da quella attuale' });
+    const problem = passwordProblem(next, u.username);
+    if (problem) return reply.code(400).send({ error: 'password_debole', message: problem });
+    store.setPassword(u.id, await hashPassword(next, cfg.pepper));
+    store.deleteUserSessions(u.id, req.auth!.tokenHash); // other browsers must log in again
+    store.audit(u.id, 'password_cambiata', req.ip);
+    return publicUser(store.userById(u.id)!);
+  });
+
+  app.post('/api/me/logout-all', { preHandler: requireAuth }, async (req, reply) => {
+    store.deleteUserSessions(req.auth!.user.id);
+    store.audit(req.auth!.user.id, 'disconnessione_ovunque', req.ip);
+    reply.header('Set-Cookie', sessionCookie('', 0));
+    return reply.code(204).send();
+  });
+
+  app.get('/api/activity', { preHandler: requireAuth }, async (req) => store.recentAudit(req.auth!.user.id));
+
+  /** Phones: admins see and revoke all of them, users only their own. */
+  app.get('/api/devices', { preHandler: requireAuth }, async (req) => {
+    const u = req.auth!.user;
+    return store.listDevices(u.role === 'admin' ? null : u.id)
+      .map(({ id, kind, name, createdAt, lastUsed, username }) => ({ id, kind, name, createdAt, lastUsed, username }));
+  });
+
+  app.delete('/api/devices/:id', { preHandler: requireAuth, schema: { params: idParams } }, async (req, reply) => {
+    const { id } = req.params as { id: number };
+    const u = req.auth!.user;
+    if (!store.deleteDevice(id, u.role === 'admin' ? null : u.id)) return reply.code(404).send({ error: 'non_trovato', message: 'Dispositivo non trovato' });
+    store.audit(u.id, 'dispositivo_rimosso', req.ip, String(id));
+    return reply.code(204).send();
+  });
+
+  // ================================================================ web: readings (every user can read)
+
+  app.get('/api/readings', {
+    preHandler: requireAuth,
+    schema: {
+      querystring: {
+        type: 'object', additionalProperties: false,
+        properties: { from: { type: 'integer', minimum: 0 }, to: { type: 'integer', minimum: 0 } },
+      },
+    },
+  }, async (req) => {
+    const q = req.query as { from?: number; to?: number };
+    const to = q.to ?? now() + 600;
+    const from = Math.max(q.from ?? to - 86400, to - 90 * 86400);
+    return { r: store.readings(from, to) };
+  });
+
+  /** Server-Sent Events: the page gets new readings as soon as the phone uploads them. */
+  app.get('/api/readings/stream', { preHandler: requireAuth }, (req, reply) => {
+    const auth = req.auth!;
+    if (hub.size >= MAX_STREAMS) return reply.code(429).send({ error: 'troppe_connessioni', message: 'Troppe connessioni aperte' });
+
+    reply.hijack();
+    const res = reply.raw;
+    const headers: Record<string, string> = {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Accel-Buffering': 'no',
+    };
+    securityHeaders((k, v) => { headers[k] = v; }, cfg.cookieSecure);
+    res.writeHead(200, headers);
+    res.write('retry: 15000\n\n');
+
+    const unsubscribe = hub.subscribe((rows) => res.write(`data: ${JSON.stringify(rows)}\n\n`));
+    // Keeps proxies from closing the stream, and ends it when the session is revoked.
+    const ping = setInterval(() => {
+      if (!store.session(auth.tokenHash)) close();
+      else res.write(': ping\n\n');
+    }, 25_000);
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(ping);
+      unsubscribe();
+      streams.delete(close);
+      res.end();
+    };
+    streams.add(close);
+    req.raw.on('close', close);
+  });
+
+  // ================================================================ web: user management (admins)
+
+  app.get('/api/admin/users', { preHandler: requireAdmin }, async () =>
+    store.listUsers().map((u) => ({
+      ...publicUser(u),
+      canWrite: u.canWrite,
+      locked: !!u.lockedUntil && u.lockedUntil > now(),
+      createdAt: u.createdAt,
+      lastLoginAt: u.lastLoginAt,
+    })));
+
+  /** Accounts are created with a temporary password that must be changed at the first login. */
+  app.post('/api/admin/users', {
+    preHandler: requireAdmin,
+    schema: {
+      body: {
+        type: 'object', required: ['username', 'password', 'role', 'canWrite'], additionalProperties: false,
+        properties: {
+          username: { type: 'string', maxLength: 32 },
+          password: { type: 'string', maxLength: 1024 },
+          role: { type: 'string', enum: ['admin', 'user'] },
+          canWrite: { type: 'boolean' },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const b = req.body as { username: string; password: string; role: Role; canWrite: boolean };
+    if (!USERNAME_RE.test(b.username)) return reply.code(400).send({ error: 'nome_non_valido', message: 'Nome utente: 3-32 caratteri tra lettere, numeri, . _ -' });
+    if (store.userByName(b.username)) return reply.code(409).send({ error: 'nome_esistente', message: 'Esiste già un utente con questo nome' });
+    const problem = passwordProblem(b.password, b.username);
+    if (problem) return reply.code(400).send({ error: 'password_debole', message: problem });
+    const id = store.createUser(b.username, await hashPassword(b.password, cfg.pepper), {
+      role: b.role, canWrite: b.canWrite, mustChangePassword: true,
+    });
+    const admin = req.auth!.user;
+    store.audit(admin.id, 'utente_creato', req.ip, b.username);
+    store.audit(id, 'account_creato_da_admin', null, admin.username);
+    return reply.code(201).send(publicUser(store.userById(id)!));
+  });
+
+  app.patch('/api/admin/users/:id', {
+    preHandler: requireAdmin,
+    schema: {
+      params: idParams,
+      body: {
+        type: 'object', additionalProperties: false, minProperties: 1,
+        properties: { role: { type: 'string', enum: ['admin', 'user'] }, canWrite: { type: 'boolean' }, unlock: { type: 'boolean' } },
+      },
+    },
+  }, async (req, reply) => {
+    const { id } = req.params as { id: number };
+    const b = req.body as { role?: Role; canWrite?: boolean; unlock?: boolean };
+    const admin = req.auth!.user;
+    const target = store.userById(id);
+    if (!target) return reply.code(404).send({ error: 'non_trovato', message: 'Utente non trovato' });
+    if (b.role === 'user' && target.role === 'admin') {
+      if (target.id === admin.id) return reply.code(400).send({ error: 'operazione_non_consentita', message: 'Non puoi togliere a te stesso il ruolo di amministratore' });
+      if (store.countAdmins() <= 1) return reply.code(400).send({ error: 'ultimo_admin', message: 'Deve restare almeno un amministratore' });
+    }
+    store.transaction(() => {
+      if (b.role && b.role !== target.role) {
+        store.setRole(id, b.role);
+        store.audit(id, 'ruolo_cambiato', null, `${b.role} (da ${admin.username})`);
+      }
+      if (b.canWrite !== undefined && b.canWrite !== target.canWrite) {
+        store.setCanWrite(id, b.canWrite);
+        store.audit(id, b.canWrite ? 'scrittura_consentita' : 'solo_lettura', null, admin.username);
+      }
+      if (b.unlock) store.unlock(id);
+    });
+    store.audit(admin.id, 'utente_modificato', req.ip, target.username);
+    return publicUser(store.userById(id)!);
+  });
+
+  /** Sets a temporary password, logs the user out everywhere; the user must choose a new one. */
+  app.post('/api/admin/users/:id/password', {
+    preHandler: requireAdmin,
+    schema: {
+      params: idParams,
+      body: { type: 'object', required: ['password'], additionalProperties: false, properties: { password: { type: 'string', maxLength: 1024 } } },
+    },
+  }, async (req, reply) => {
+    const { id } = req.params as { id: number };
+    const { password } = req.body as { password: string };
+    const admin = req.auth!.user;
+    const target = store.userById(id);
+    if (!target) return reply.code(404).send({ error: 'non_trovato', message: 'Utente non trovato' });
+    if (target.id === admin.id) return reply.code(400).send({ error: 'operazione_non_consentita', message: 'Per la tua password usa "Cambia password"' });
+    const problem = passwordProblem(password, target.username);
+    if (problem) return reply.code(400).send({ error: 'password_debole', message: problem });
+    store.setPassword(id, await hashPassword(password, cfg.pepper), true);
+    store.deleteUserSessions(id);
+    store.audit(id, 'password_reimpostata', null, admin.username);
+    store.audit(admin.id, 'password_utente_reimpostata', req.ip, target.username);
+    return reply.code(204).send();
+  });
+
+  app.delete('/api/admin/users/:id', { preHandler: requireAdmin, schema: { params: idParams } }, async (req, reply) => {
+    const { id } = req.params as { id: number };
+    const admin = req.auth!.user;
+    const target = store.userById(id);
+    if (!target) return reply.code(404).send({ error: 'non_trovato', message: 'Utente non trovato' });
+    if (target.id === admin.id) return reply.code(400).send({ error: 'operazione_non_consentita', message: 'Non puoi eliminare il tuo account' });
+    store.deleteUser(id); // sessions and phones go with it; readings stay
+    store.audit(admin.id, 'utente_eliminato', req.ip, target.username);
+    return reply.code(204).send();
+  });
+
+  // ================================================================ app (device) API
+
+  /** Public: lets the app check that an address really is a G7 Monitor server before asking for credentials. */
+  app.get('/api/v1/info', async () => ({ service: 'g7monitor', api: 1 }));
+
+  /**
+   * Pairs a phone: the app sends the user's credentials once and keeps only the returned token.
+   * kind "uploader" (phone with the sensor) needs write permission; "reader" (follower) does not.
+   */
+  app.post('/api/v1/devices', {
+    schema: {
+      body: {
+        type: 'object', required: ['username', 'password', 'name'], additionalProperties: false,
+        properties: {
+          ...credentialsProps,
+          name: { type: 'string', minLength: 1, maxLength: 60 },
+          kind: { type: 'string', enum: ['uploader', 'reader'] },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const body = req.body as Credentials & { name: string; kind?: DeviceKind };
+    const kind = body.kind ?? 'uploader';
+    const r = await authenticate(store, cfg.pepper, body, req.ip);
+    if (!r.ok) return reply.code(r.status).send({ error: r.error, message: r.message });
+    if (r.user.mustChangePassword) {
+      return forbidden(reply, 'cambio_password_richiesto', 'Accedi prima al sito e scegli una nuova password');
+    }
+    if (kind === 'uploader' && !mayWrite(r.user)) {
+      return forbidden(reply, 'scrittura_non_consentita', 'Il tuo account può solo leggere: chiedi a un amministratore il permesso di caricare');
+    }
+    if (store.listDevices(r.user.id).length >= MAX_DEVICES) {
+      return reply.code(409).send({ error: 'troppi_dispositivi', message: 'Troppi dispositivi collegati: rimuovine qualcuno dal sito' });
+    }
+    const token = newToken(DEVICE_TOKEN_PREFIX);
+    store.createDevice(r.user.id, kind, body.name.trim() || 'Telefono', sha256(token));
+    store.audit(r.user.id, 'dispositivo_aggiunto', req.ip, body.name.slice(0, 60));
+    return reply.code(201).send({ token, username: r.user.username, last: store.readingStats().last });
+  });
+
+  /** "Scollega" in the app: the phone revokes its own token (allowed even without write permission). */
+  app.delete('/api/v1/devices/self', { preHandler: requireDevice }, async (req, reply) => {
+    store.deleteDevice(req.deviceId!, req.deviceUser!);
+    store.audit(req.deviceUser!, 'dispositivo_rimosso', req.ip, "dall'app");
+    return reply.code(204).send();
+  });
+
+  app.get('/api/v1/status', { preHandler: requireDevice }, async (req) => {
+    const u = store.userById(req.deviceUser!)!;
+    return { username: u.username, last: store.readingStats().last };
+  });
+
+  /**
+   * Follower phones: readings newer than "since" (Unix seconds), oldest first, at most "limit".
+   * Polled once per expected reading, so a typical answer holds a single row.
+   */
+  app.get('/api/v1/readings', {
+    preHandler: requireDevice,
+    schema: {
+      querystring: {
+        type: 'object', required: ['since'], additionalProperties: false,
+        properties: { since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 5000 } },
+      },
+    },
+  }, async (req) => {
+    const q = req.query as { since: number; limit?: number };
+    return { r: store.readingsAfter(Math.max(q.since, now() - 90 * 86400), q.limit ?? 3000) };
+  });
+
+  app.post('/api/v1/readings', {
+    preHandler: requireUploader,
+    preParsing: gunzipBody,
+    bodyLimit: 512 * 1024,
+    schema: {
+      body: {
+        type: 'object', required: ['b', 'r'], additionalProperties: false,
+        properties: {
+          b: { type: 'integer', minimum: MIN_TS, maximum: 4_102_444_800 },
+          r: { type: 'array', maxItems: 5000, items: { type: 'array' } },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const { b, r } = req.body as { b: number; r: unknown[] };
+    const rows = decodeRows(b, r);
+    if (typeof rows === 'string') return reply.code(400).send({ error: 'dati_non_validi', message: rows });
+    const added = store.insertReadings(rows);
+    hub.publish(added);
+    return { n: added.length };
+  });
+
+  // ================================================================ static web UI
+
+  const publicDir = opts.publicDir ?? fileURLToPath(new URL('../public/', import.meta.url));
+  const files = loadStatic(publicDir);
+  const serve = (name: string) => async (req: FastifyRequest, reply: FastifyReply) => {
+    const f = files.get(name)!;
+    reply.header('Content-Type', f.type).header('ETag', f.etag).header('Vary', 'Accept-Encoding')
+      .header('Cache-Control', 'no-cache'); // always revalidated: tiny 304s, never a stale UI
+    if (req.headers['if-none-match'] === f.etag) return reply.code(304).send();
+    const enc = pickEncoding(req.headers['accept-encoding']);
+    if (enc) reply.header('Content-Encoding', enc);
+    return reply.send(enc === 'br' ? f.br : enc === 'gzip' ? f.gz : f.raw);
+  };
+  for (const name of files.keys()) app.get(name === 'index.html' ? '/' : `/${name}`, serve(name));
+
+  return app;
+}
