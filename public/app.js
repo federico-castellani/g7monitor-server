@@ -175,9 +175,36 @@ function renderHero() {
   $('cur-delta').textContent = prev && last.t - prev.t < 12 * 60_000 ? `${fmtDelta(last.v - prev.v)} ${unitLabel()}` : '';
   $('cur-ago').textContent = minutes < 1 ? 'adesso' : minutes < 60 ? `${minutes} min fa` : `alle ${timeFmt.format(last.t)}`;
   const finger = fingersticks.at(-1);
-  $('cur-finger').textContent = finger ? `Glucometro ${fmt(finger.v)} alle ${timeFmt.format(finger.t)}` : '';
+  const fingerSensor = finger && sensorAt(finger.t);
+  $('cur-finger').textContent = finger
+    ? `Glucometro ${fmt(finger.v)} alle ${timeFmt.format(finger.t)}` +
+      (fingerSensor != null ? ` · sensore ${fmt(fingerSensor)} (${fmtDelta(finger.v - fingerSensor)})` : '')
+    : '';
   document.title = `${fmt(last.v)}${tr ? ' ' + tr.arrow : ''} · G7 Monitor`;
 }
+
+/**
+ * What the sensor read at time t, to compare with a meter result: interpolated between the
+ * readings around it (at most 12 minutes apart), or the nearest one within 5 minutes.
+ * Same rule as the phone app (Glucose.sensorAt).
+ */
+function sensorAt(t) {
+  let lo = 0, hi = readings.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (readings[mid].t < t) lo = mid + 1; else hi = mid;
+  }
+  const after = readings[lo], before = readings[lo - 1];
+  if (after?.t === t) return after.v;
+  if (before && after && after.t - before.t <= 12 * 60_000) {
+    return Math.round(before.v + ((after.v - before.v) * (t - before.t)) / (after.t - before.t));
+  }
+  const near = [before, after].filter((r) => r && Math.abs(r.t - t) <= 5 * 60_000);
+  return near.length ? near.reduce((a, b) => (Math.abs(a.t - t) <= Math.abs(b.t - t) ? a : b)).v : null;
+}
+
+const diamond = (cx, cy, h) =>
+  `M${cx.toFixed(1)} ${(cy - h).toFixed(1)}L${(cx + h).toFixed(1)} ${cy.toFixed(1)}L${cx.toFixed(1)} ${(cy + h).toFixed(1)}L${(cx - h).toFixed(1)} ${cy.toFixed(1)}Z`;
 
 function renderChart() {
   const el = $('chart');
@@ -247,24 +274,38 @@ function renderChart() {
       out.push(`<circle class="${rangeClass(r.v)}" cx="${f(x(r.t))}" cy="${f(y(r.v))}" r="${radius}"/>`);
     }
   }
-  // meter results: outlined diamond with its value
-  for (const s of fingersticks) {
-    if (s.t < start || s.t > end) continue;
-    const cx = x(s.t), cy = y(Math.min(Math.max(s.v, yMin), yMax)), h = 6;
-    out.push(`<path class="finger ${rangeClass(s.v)}" d="M${f(cx)} ${f(cy - h)}L${f(cx + h)} ${f(cy)}L${f(cx)} ${f(cy + h)}L${f(cx - h)} ${f(cy)}Z"/>`);
-    out.push(`<text class="axis finger-label" x="${f(cx)}" y="${f(Math.max(cy - h - 4, 10))}" text-anchor="middle">${fmt(s.v)}</text>`);
+  // meter results: a colour of their own, a dashed guide down to the time axis, a halo that
+  // cuts through the trace and the value in a filled tag (hover or touch compares with the sensor)
+  const sticks = fingersticks.filter((s) => s.t >= start && s.t <= end);
+  for (const s of sticks) {
+    const cx = x(s.t), cy = y(Math.min(Math.max(s.v, yMin), yMax)), h = 8;
+    out.push(`<line class="finger-guide" x1="${f(cx)}" x2="${f(cx)}" y1="${f(cy + h)}" y2="${padT + plotH}"/>`);
+    out.push(`<path class="finger-halo" d="${diamond(cx, cy, h + 2.5)}"/>`);
+    out.push(`<path class="finger" d="${diamond(cx, cy, h)}"/>`);
+    out.push(`<circle class="finger-dot" cx="${f(cx)}" cy="${f(cy)}" r="2"/>`);
+    const label = fmt(s.v), tw = label.length * 7 + 10, th = 17;
+    const tx = Math.min(Math.max(cx - tw / 2, padL), W - padR - tw);
+    const ty = cy - h - 4 - th >= 0 ? cy - h - 4 - th : cy + h + 4;
+    out.push(`<rect class="finger-tag" x="${f(tx)}" y="${f(ty)}" width="${tw}" height="${th}" rx="${th / 2}"/>`);
+    out.push(`<text class="finger-tag-text" x="${f(tx + tw / 2)}" y="${f(ty + 12.5)}" text-anchor="middle">${label}</text>`);
   }
   out.push(`<line class="now" x1="${f(x(now))}" x2="${f(x(now))}" y1="${padT}" y2="${padT + plotH}"/>`);
   out.push('<g id="cursor"></g>');
   svg.innerHTML = out.join('');
-  geom = { x, y, visible, padT, plotH, W };
+  geom = { x, y, visible, sticks, yMin, yMax, padT, plotH, W };
   $('tip').hidden = true;
 }
 
 function inspect(clientX) {
-  if (!geom?.visible.length) return;
+  if (!geom) return;
   const rect = $('chart').getBoundingClientRect();
   const px = clientX - rect.left;
+  // A meter result close to the pointer wins: compared with what the sensor read at that moment.
+  const stick = geom.sticks
+    .filter((s) => Math.abs(geom.x(s.t) - px) <= 14)
+    .sort((a, b) => Math.abs(geom.x(a.t) - px) - Math.abs(geom.x(b.t) - px))[0];
+  if (stick) return inspectFinger(stick);
+  if (!geom.visible.length) return;
   const v = geom.visible;
   // binary search on x
   let lo = 0, hi = v.length - 1;
@@ -278,7 +319,29 @@ function inspect(clientX) {
     `<line class="cursor" x1="${cx}" x2="${cx}" y1="${geom.padT}" y2="${geom.padT + geom.plotH}"/>` +
     `<circle class="focus ${rangeClass(r.v)}" cx="${cx}" cy="${cy}" r="6"/>`;
   const tip = $('tip');
+  tip.classList.remove('finger-tip');
   tip.textContent = `${fmt(r.v)} ${unitLabel()} · ${(prefs.hours > 24 ? dateTimeFmt : timeFmt).format(r.t)}`;
+  tip.hidden = false;
+  const half = tip.offsetWidth / 2;
+  tip.style.left = `${Math.min(Math.max(cx, half), geom.W - half)}px`;
+}
+
+function inspectFinger(s) {
+  const cx = geom.x(s.t), cy = geom.y(Math.min(Math.max(s.v, geom.yMin), geom.yMax));
+  document.getElementById('cursor').innerHTML =
+    `<line class="finger-focus" x1="${cx}" x2="${cx}" y1="${geom.padT}" y2="${geom.padT + geom.plotH}"/>` +
+    `<path class="finger-halo" d="${diamond(cx, cy, 13.5)}"/><path class="finger" d="${diamond(cx, cy, 11)}"/>`;
+  const sensor = sensorAt(s.t);
+  const tip = $('tip');
+  tip.classList.add('finger-tip');
+  const title = document.createElement('div');
+  title.textContent = `Glucometro ${fmt(s.v)} ${unitLabel()} · ${(prefs.hours > 24 ? dateTimeFmt : timeFmt).format(s.t)}`;
+  const detail = document.createElement('div');
+  detail.className = 'tip-detail';
+  detail.textContent = sensor != null
+    ? `Sensore ${fmt(sensor)} · differenza ${fmtDelta(s.v - sensor)} ${unitLabel()}`
+    : 'Nessuna lettura del sensore in quel momento';
+  tip.replaceChildren(title, detail);
   tip.hidden = false;
   const half = tip.offsetWidth / 2;
   tip.style.left = `${Math.min(Math.max(cx, half), geom.W - half)}px`;

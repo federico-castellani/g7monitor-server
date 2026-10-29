@@ -11,6 +11,7 @@
   --in: #1f9d62;
   --high: #d98a00;
   --stale: #8a9099;
+  --meter: #8e44d9; /* meter results: a hue no glucose range uses */
   --danger: #c62828;
   --radius: 18px;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.04), 0 4px 16px rgb(0 0 0 / 0.04);
@@ -31,6 +32,7 @@
     --in: #4cd597;
     --high: #ffc145;
     --stale: #6e757e;
+    --meter: #c9a2ff;
     --danger: #ff6b6b;
     --shadow: none;
     color-scheme: dark;
@@ -206,9 +208,18 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .chart .low { fill: var(--low); }
 .chart .in { fill: var(--in); }
 .chart .high { fill: var(--high); }
-.chart .finger { stroke: var(--surface); stroke-width: 1.5; }
-.chart .finger-label { font-weight: 600; fill: var(--text); }
+.chart .finger-guide { stroke: var(--meter); stroke-opacity: 0.45; stroke-width: 1.5; stroke-dasharray: 4 4; }
+.chart .finger-halo { fill: var(--surface); }
+.chart .finger { fill: var(--meter); }
+.chart .finger-dot { fill: var(--surface); }
+.chart .finger-tag { fill: var(--meter); }
+.chart .finger-tag-text { fill: var(--surface); font-size: 11px; font-weight: 700; }
+.chart .finger-focus { stroke: var(--meter); stroke-opacity: 0.6; stroke-width: 1.5; }
 .finger-pill { font-weight: 500; color: var(--muted); }
+.finger-pill::before { content: "\25C6  "; color: var(--meter); }
+.finger-pill:empty { display: none; }
+.tip.finger-tip { border-color: var(--meter); border-width: 1.5px; }
+.tip .tip-detail { font-weight: 400; color: var(--muted); font-size: 12px; margin-top: 2px; }
 .chart .now { stroke: var(--primary); stroke-opacity: 0.4; stroke-width: 1.5; }
 .chart .cursor { stroke: var(--text); stroke-opacity: 0.4; stroke-width: 1.2; }
 .chart .focus { stroke: var(--surface); stroke-width: 3; }
