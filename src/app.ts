@@ -8,7 +8,7 @@ import Fastify from 'fastify';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Config } from './config.ts';
 import { USERNAME_RE, mayWrite, now } from './store.ts';
-import type { DeviceKind, ReadingRow, Role, Store, User } from './store.ts';
+import type { DeviceKind, FingerRow, ReadingRow, Role, Store, User } from './store.ts';
 import { authenticate } from './auth.ts';
 import type { Credentials } from './auth.ts';
 import { hashPassword, passwordProblem, verifyPassword } from './security/password.ts';
@@ -42,7 +42,8 @@ declare module 'fastify' {
 
 // ---------------------------------------------------------------------- live updates
 
-type Listener = (rows: ReadingRow[]) => void;
+/** "r" sensor readings, "f" blood glucose meter results. */
+type Listener = (kind: 'r' | 'f', rows: unknown[]) => void;
 
 /** In-process fan-out of new readings to the open SSE streams. */
 class Hub {
@@ -57,8 +58,8 @@ class Hub {
     return this.listeners.size;
   }
 
-  publish(rows: ReadingRow[]): void {
-    if (rows.length) this.listeners.forEach((l) => l(rows));
+  publish(kind: 'r' | 'f', rows: unknown[]): void {
+    if (rows.length) this.listeners.forEach((l) => l(kind, rows));
   }
 }
 
@@ -405,7 +406,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     const q = req.query as { from?: number; to?: number };
     const to = q.to ?? now() + 600;
     const from = Math.max(q.from ?? to - 86400, to - 90 * 86400);
-    return { r: store.readings(from, to) };
+    return { r: store.readings(from, to), f: store.fingersticks(from, to) };
   });
 
   /**
@@ -417,7 +418,13 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
    */
   const openStream = (
     req: FastifyRequest, reply: FastifyReply,
-    opts: { idlePingMs: number; stillValid: () => boolean; backlog?: ReadingRow[] },
+    opts: {
+      idlePingMs: number;
+      stillValid: () => boolean;
+      backlog?: ReadingRow[];
+      /** null: the client does not know meter results, never send them (older apps). */
+      fingersticks: FingerRow[] | null;
+    },
   ) => {
     reply.hijack();
     const res = reply.raw;
@@ -434,9 +441,15 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
       lastWrite = Date.now();
     };
     write('retry: 15000\n\n');
-    const send = (rows: ReadingRow[]) => write(`data: ${JSON.stringify(rows)}\n\n`);
+    // Readings are unnamed events (what older clients expect); meter results are a named event,
+    // which old web pages ignore and old apps never request.
+    const send = (kind: 'r' | 'f', rows: unknown[]) => {
+      if (kind === 'r') write(`data: ${JSON.stringify(rows)}\n\n`);
+      else if (opts.fingersticks) write(`event: fingerstick\ndata: ${JSON.stringify(rows)}\n\n`);
+    };
     const unsubscribe = hub.subscribe(send);
-    if (opts.backlog?.length) send(opts.backlog);
+    if (opts.backlog?.length) send('r', opts.backlog);
+    if (opts.fingersticks?.length) send('f', opts.fingersticks);
 
     const timer = setInterval(() => {
       if (!opts.stillValid()) close();
@@ -459,7 +472,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   app.get('/api/readings/stream', { preHandler: requireAuth }, (req, reply) => {
     if (hub.size >= MAX_STREAMS) return reply.code(429).send({ error: 'troppe_connessioni', message: 'Troppe connessioni aperte' });
     const token = req.auth!.tokenHash;
-    openStream(req, reply, { idlePingMs: 25_000, stillValid: () => !!store.session(token) });
+    openStream(req, reply, { idlePingMs: 25_000, stillValid: () => !!store.session(token), fingersticks: [] });
   });
 
   // ================================================================ web: user management (admins)
@@ -631,12 +644,18 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     schema: {
       querystring: {
         type: 'object', required: ['since'], additionalProperties: false,
-        properties: { since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 5000 } },
+        properties: {
+          since: { type: 'integer', minimum: 0 },
+          limit: { type: 'integer', minimum: 1, maximum: 5000 },
+          fsince: { type: 'integer', minimum: 0 }, // meter results after this time (newer apps)
+        },
       },
     },
   }, async (req) => {
-    const q = req.query as { since: number; limit?: number };
-    return { r: store.readingsAfter(Math.max(q.since, now() - 90 * 86400), q.limit ?? 3000) };
+    const q = req.query as { since: number; limit?: number; fsince?: number };
+    const r = store.readingsAfter(Math.max(q.since, now() - 90 * 86400), q.limit ?? 3000);
+    if (q.fsince === undefined) return { r };
+    return { r, f: store.fingersticksAfter(Math.max(q.fsince, now() - 90 * 86400), 1000) };
   });
 
   /**
@@ -650,17 +669,18 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     schema: {
       querystring: {
         type: 'object', required: ['since'], additionalProperties: false,
-        properties: { since: { type: 'integer', minimum: 0 } },
+        properties: { since: { type: 'integer', minimum: 0 }, fsince: { type: 'integer', minimum: 0 } },
       },
     },
   }, (req, reply) => {
     if (hub.size >= MAX_STREAMS) return reply.code(429).send({ error: 'troppe_connessioni', message: 'Troppe connessioni aperte' });
-    const { since } = req.query as { since: number };
+    const { since, fsince } = req.query as { since: number; fsince?: number };
     const deviceId = req.deviceId!;
     openStream(req, reply, {
       idlePingMs: DEVICE_PING_MS,
       stillValid: () => store.deviceExists(deviceId),
       backlog: store.readingsAfter(Math.max(since, now() - 90 * 86400), 3000),
+      fingersticks: fsince === undefined ? null : store.fingersticksAfter(Math.max(fsince, now() - 90 * 86400), 1000),
     });
   });
 
@@ -682,7 +702,38 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     const rows = decodeRows(b, r);
     if (typeof rows === 'string') return reply.code(400).send({ error: 'dati_non_validi', message: rows });
     const added = store.insertReadings(rows);
-    hub.publish(added);
+    hub.publish('r', added);
+    return { n: added.length };
+  });
+
+  /** Blood glucose meter results from the sensor phone: [[unix seconds, mg/dL, meter name | null], …]. */
+  app.post('/api/v1/fingersticks', {
+    preHandler: requireUploader,
+    schema: {
+      body: {
+        type: 'object', required: ['f'], additionalProperties: false,
+        properties: { f: { type: 'array', maxItems: 1000, items: { type: 'array' } } },
+      },
+    },
+  }, async (req, reply) => {
+    const rows: FingerRow[] = [];
+    const maxTs = now() + 600;
+    for (const row of (req.body as { f: unknown[] }).f) {
+      if (!Array.isArray(row) || row.length !== 3) return reply.code(400).send({ error: 'dati_non_validi', message: 'riga non valida' });
+      const [ts, mgdl, meter] = row as unknown[];
+      if (!Number.isInteger(ts) || (ts as number) < MIN_TS || (ts as number) > maxTs) {
+        return reply.code(400).send({ error: 'dati_non_validi', message: 'orario non valido' });
+      }
+      if (!Number.isInteger(mgdl) || (mgdl as number) < 20 || (mgdl as number) > 600) {
+        return reply.code(400).send({ error: 'dati_non_validi', message: 'glicemia fuori intervallo' });
+      }
+      if (meter !== null && (typeof meter !== 'string' || meter.length > 60)) {
+        return reply.code(400).send({ error: 'dati_non_validi', message: 'nome del glucometro non valido' });
+      }
+      rows.push([ts as number, mgdl as number, meter as string | null]);
+    }
+    const added = store.insertFingersticks(rows);
+    hub.publish('f', added);
     return { n: added.length };
   });
 

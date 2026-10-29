@@ -460,3 +460,53 @@ describe('live stream', () => {
     }
   });
 });
+
+// ------------------------------------------------------------------ blood glucose meter
+
+describe('fingersticks', () => {
+  test('uploaded once, deduplicated, visible to the web, to followers and live on their stream', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'fede', 'admin');
+    await addUser(store, 'ospite');
+    const uploader = await pair(app, 'fede');
+    const reader = (await app.inject({ method: 'POST', url: '/api/v1/devices', payload: { username: 'ospite', password: PASSWORD, name: 'Tel', kind: 'reader' } })).json().token as string;
+    const t = Math.floor(Date.now() / 1000) - 600;
+    const send = (token: string, f: unknown[]) => app.inject({
+      method: 'POST', url: '/api/v1/fingersticks', headers: { authorization: `Bearer ${token}` }, payload: { f },
+    });
+
+    assert.deepEqual((await send(uploader, [[t, 112, 'Contour'], [t + 30, 112, 'Contour']])).json(), { n: 1 }); // same test twice
+    assert.deepEqual((await send(uploader, [[t + 40, 118, 'Contour']])).json(), { n: 1 }); // re-test, other value
+    assert.equal((await send(uploader, [[t, 700, null]])).statusCode, 400);
+    assert.equal((await send(reader, [[t, 100, null]])).statusCode, 403); // read-only phone
+
+    const cookie = (await login(app, 'ospite')).cookie;
+    const web = (await app.inject({ url: `/api/readings?from=${t - 60}`, headers: { cookie } })).json();
+    assert.deepEqual(web.f, [[t, 112, 'Contour'], [t + 40, 118, 'Contour']]);
+
+    const auth = { authorization: `Bearer ${reader}` };
+    const old = (await app.inject({ url: `/api/v1/readings?since=${t - 60}`, headers: auth })).json();
+    assert.equal(old.f, undefined); // older apps never see them
+    const follower = (await app.inject({ url: `/api/v1/readings?since=${t - 60}&fsince=${t + 10}`, headers: auth })).json();
+    assert.deepEqual(follower.f, [[t + 40, 118, 'Contour']]);
+
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const abort = new AbortController();
+    try {
+      const res = await fetch(`${address}/api/v1/readings/stream?since=${t}&fsince=${t + 100}`, { headers: auth, signal: abort.signal });
+      const reader$ = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      await send(uploader, [[t + 300, 95, 'Contour']]);
+      while (!buffer.includes('event: fingerstick')) {
+        const { value, done } = await reader$.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+      }
+      assert.match(buffer, /event: fingerstick\ndata: \[\[\d+,95,"Contour"\]\]/);
+    } finally {
+      abort.abort();
+      await app.close();
+    }
+  });
+});

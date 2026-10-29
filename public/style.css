@@ -206,6 +206,9 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .chart .low { fill: var(--low); }
 .chart .in { fill: var(--in); }
 .chart .high { fill: var(--high); }
+.chart .finger { stroke: var(--surface); stroke-width: 1.5; }
+.chart .finger-label { font-weight: 600; fill: var(--text); }
+.finger-pill { font-weight: 500; color: var(--muted); }
 .chart .now { stroke: var(--primary); stroke-opacity: 0.4; stroke-width: 1.5; }
 .chart .cursor { stroke: var(--text); stroke-opacity: 0.4; stroke-width: 1.2; }
 .chart .focus { stroke: var(--surface); stroke-width: 3; }

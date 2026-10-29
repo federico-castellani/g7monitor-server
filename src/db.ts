@@ -77,6 +77,16 @@ const MIGRATIONS = [
   ) STRICT;
   CREATE INDEX audit_user ON audit(user_id, at);
   `,
+  // 2: blood glucose meter results (finger sticks), kept apart from the sensor's readings
+  `
+  CREATE TABLE fingersticks (
+    id    INTEGER PRIMARY KEY,
+    ts    INTEGER NOT NULL,
+    mgdl  INTEGER NOT NULL,
+    meter TEXT
+  ) STRICT;
+  CREATE INDEX fingersticks_ts ON fingersticks(ts);
+  `,
 ];
 
 export function openDb(path: string): DatabaseSync {

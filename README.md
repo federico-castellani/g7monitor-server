@@ -8,6 +8,7 @@ Server per [G7 Monitor](https://github.com/federico-castellani/g7monitor). Racco
 
 - **Interfaccia web**: valore attuale con freccia di tendenza, grafico 3 h / 6 h / 12 h / 24 h / 7 giorni (tocca o passa sopra per leggere il singolo valore), tempo nei range, media, GMI, variabilità. Tema chiaro/scuro, adatta al telefono, installabile come app.
 - **Aggiornamento in tempo reale**: la pagina riceve le letture appena il telefono le carica (Server-Sent Events), senza ricaricare.
+- **Glucometro**: le misurazioni capillari che l'app riceve da un glucometro Bluetooth compaiono sul grafico come rombi con il valore, in tempo reale, e arrivano anche ai telefoni che ricevono.
 - **Due ruoli**:
   - *amministratore*: vede e carica le glicemie e gestisce gli utenti dal sito, cioè li crea, cambia ruolo e permessi, reimposta password, sblocca ed elimina;
   - *utente*: vede le glicemie e, se un amministratore lo consente, può anche caricarle (collegare un telefono).
@@ -182,9 +183,10 @@ Con Docker: `docker compose exec g7server node src/cli.ts <comando>`.
 |---|---|---|---|
 | GET | `/api/v1/info` | nessuna | permette all'app di riconoscere un server G7 Monitor prima di chiedere le credenziali |
 | POST | `/api/v1/devices` | nome utente e password (+ TOTP) | collega un telefono e restituisce il token: `kind: "uploader"` per caricare (serve il permesso di caricare), `"reader"` per ricevere |
-| GET | `/api/v1/readings/stream?since=` | `Bearer` (anche in sola lettura) | letture in tempo reale per i telefoni che ricevono (SSE): prima quelle successive a `since`, poi ogni nuova |
-| GET | `/api/v1/readings?since=` | `Bearer` (anche in sola lettura) | letture successive a `since` (richiesta singola) |
+| GET | `/api/v1/readings/stream?since=&fsince=` | `Bearer` (anche in sola lettura) | letture in tempo reale per i telefoni che ricevono (SSE): prima quelle successive a `since`, poi ogni nuova; con `fsince` anche le misurazioni del glucometro, come evento `fingerstick` |
+| GET | `/api/v1/readings?since=&fsince=` | `Bearer` (anche in sola lettura) | letture successive a `since` (richiesta singola); con `fsince` anche le misurazioni del glucometro (`f`) |
 | POST | `/api/v1/readings` | `Bearer` token di caricamento | carica letture (`Content-Encoding: gzip` facoltativo) |
+| POST | `/api/v1/fingersticks` | `Bearer` token di caricamento | carica misurazioni del glucometro `[[secondi, mg/dL, nome glucometro], …]`; la stessa misurazione arrivata due volte (stesso valore entro 60 s) viene salvata una volta sola |
 | GET | `/api/v1/status` | `Bearer` | account e ultima lettura |
 | DELETE | `/api/v1/devices/self` | `Bearer` | il telefono revoca il proprio token |
 | GET | `/api/readings?from=&to=` | cookie | letture (max 90 giorni per richiesta) |

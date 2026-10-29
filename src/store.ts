@@ -27,6 +27,12 @@ export const mayWrite = (u: Pick<User, 'role' | 'canWrite'>): boolean => u.role 
 /** Compact row as sent on the wire: [unix seconds, mg/dL, trend x10 | null, source]. */
 export type ReadingRow = [ts: number, mgdl: number, trend: number | null, source: number];
 
+/** Blood glucose meter result: [unix seconds, mg/dL, meter name | null]. */
+export type FingerRow = [ts: number, mgdl: number, meter: string | null];
+
+/** Same meter value within this many seconds = the same measurement sent twice. */
+export const FINGERSTICK_WINDOW = 60;
+
 export interface Session { userId: number; createdAt: number; lastSeen: number }
 export type DeviceKind = 'uploader' | 'reader';
 export interface Device { id: number; userId: number; kind: DeviceKind; name: string; createdAt: number; lastUsed: number | null }
@@ -301,6 +307,32 @@ export class Store {
     const s = this.q('SELECT ts, mgdl, trend, source FROM readings WHERE ts > ? ORDER BY ts LIMIT ?');
     s.setReturnArrays(true);
     return s.all(since, limit) as unknown as ReadingRow[];
+  }
+
+  /**
+   * Meter results, skipping one already stored with the same value within [FINGERSTICK_WINDOW]
+   * seconds (re-sync, second phone). A re-test usually gives another value and is kept.
+   */
+  insertFingersticks(rows: FingerRow[]): FingerRow[] {
+    const dup = this.q('SELECT 1 FROM fingersticks WHERE ts BETWEEN ? AND ? AND mgdl = ? LIMIT 1');
+    const ins = this.q('INSERT INTO fingersticks (ts, mgdl, meter) VALUES (?, ?, ?)');
+    return this.transaction(() => rows.filter(([ts, mgdl, meter]) => {
+      if (dup.get(ts - FINGERSTICK_WINDOW, ts + FINGERSTICK_WINDOW, mgdl)) return false;
+      ins.run(ts, mgdl, meter);
+      return true;
+    }));
+  }
+
+  fingersticks(from: number, to: number): FingerRow[] {
+    const s = this.q('SELECT ts, mgdl, meter FROM fingersticks WHERE ts BETWEEN ? AND ? ORDER BY ts');
+    s.setReturnArrays(true);
+    return s.all(from, to) as unknown as FingerRow[];
+  }
+
+  fingersticksAfter(since: number, limit: number): FingerRow[] {
+    const s = this.q('SELECT ts, mgdl, meter FROM fingersticks WHERE ts > ? ORDER BY ts LIMIT ?');
+    s.setReturnArrays(true);
+    return s.all(since, limit) as unknown as FingerRow[];
   }
 
   readingStats(): { count: number; last: number | null } {

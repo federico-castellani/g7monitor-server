@@ -75,6 +75,8 @@ const roleLabel = (u) => (u.role === 'admin' ? 'Amministratore' : u.canWrite ? '
 let me = null;
 /** Sorted by time: { t: ms, v: mg/dL, r: mg/dL/min | null } */
 let readings = [];
+/** Blood glucose meter results, sorted by time: { t: ms, v: mg/dL, meter } */
+let fingersticks = [];
 let stream = null;
 let geom = null; // chart geometry, for touch inspection
 
@@ -85,6 +87,17 @@ async function loadReadings() {
   const from = to - 600 - prefs.hours * 3600;
   const data = await api(`/api/readings?from=${from}&to=${to}`);
   readings = data.r.map(toReading);
+  fingersticks = (data.f ?? []).map(toFingerstick);
+  render();
+}
+
+const toFingerstick = ([ts, mgdl, meter]) => ({ t: ts * 1000, v: mgdl, meter });
+
+function mergeFingersticks(rows) {
+  const start = Date.now() - prefs.hours * 3600e3;
+  const all = [...fingersticks, ...rows.map(toFingerstick)].filter((f) => f.t >= start);
+  const seen = new Set();
+  fingersticks = all.sort((a, b) => a.t - b.t).filter((f) => !seen.has(`${f.t}:${f.v}`) && seen.add(`${f.t}:${f.v}`));
   render();
 }
 
@@ -115,6 +128,7 @@ function connectStream() {
     missed = false;
   };
   es.onmessage = (e) => merge(JSON.parse(e.data));
+  es.addEventListener('fingerstick', (e) => mergeFingersticks(JSON.parse(e.data)));
   es.onerror = () => {
     setLive(false);
     missed = true;
@@ -160,6 +174,8 @@ function renderHero() {
   const prev = readings.at(-2);
   $('cur-delta').textContent = prev && last.t - prev.t < 12 * 60_000 ? `${fmtDelta(last.v - prev.v)} ${unitLabel()}` : '';
   $('cur-ago').textContent = minutes < 1 ? 'adesso' : minutes < 60 ? `${minutes} min fa` : `alle ${timeFmt.format(last.t)}`;
+  const finger = fingersticks.at(-1);
+  $('cur-finger').textContent = finger ? `Glucometro ${fmt(finger.v)} alle ${timeFmt.format(finger.t)}` : '';
   document.title = `${fmt(last.v)}${tr ? ' ' + tr.arrow : ''} · G7 Monitor`;
 }
 
@@ -230,6 +246,13 @@ function renderChart() {
     for (const r of visible) {
       out.push(`<circle class="${rangeClass(r.v)}" cx="${f(x(r.t))}" cy="${f(y(r.v))}" r="${radius}"/>`);
     }
+  }
+  // meter results: outlined diamond with its value
+  for (const s of fingersticks) {
+    if (s.t < start || s.t > end) continue;
+    const cx = x(s.t), cy = y(Math.min(Math.max(s.v, yMin), yMax)), h = 6;
+    out.push(`<path class="finger ${rangeClass(s.v)}" d="M${f(cx)} ${f(cy - h)}L${f(cx + h)} ${f(cy)}L${f(cx)} ${f(cy + h)}L${f(cx - h)} ${f(cy)}Z"/>`);
+    out.push(`<text class="axis finger-label" x="${f(cx)}" y="${f(Math.max(cy - h - 4, 10))}" text-anchor="middle">${fmt(s.v)}</text>`);
   }
   out.push(`<line class="now" x1="${f(x(now))}" x2="${f(x(now))}" y1="${padT}" y2="${padT + plotH}"/>`);
   out.push('<g id="cursor"></g>');
