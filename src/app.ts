@@ -98,7 +98,7 @@ function readCookie(req: FastifyRequest, name: string): string | null {
   return null;
 }
 
-interface StaticFile { type: string; etag: string; raw: Buffer; br: Buffer; gz: Buffer }
+interface StaticFile { type: string; etag: string; version: string; raw: Buffer; br: Buffer; gz: Buffer }
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -108,20 +108,36 @@ const TYPES: Record<string, string> = {
   '.webmanifest': 'application/manifest+json',
 };
 
-/** The web UI is a handful of small files: loaded and pre-compressed once at startup. */
+function staticFile(type: string, raw: Buffer): StaticFile {
+  const hash = createHash('sha256').update(raw).digest('base64url');
+  return {
+    type,
+    raw,
+    etag: `"${hash.slice(0, 22)}"`,
+    version: hash.slice(0, 10),
+    br: brotliCompressSync(raw, { params: { [zc.BROTLI_PARAM_QUALITY]: 11 } }),
+    gz: gzipSync(raw, { level: 9 }),
+  };
+}
+
+/**
+ * The web UI is a handful of small files: loaded and pre-compressed once at startup.
+ * index.html links each file with its content hash (/app.js?v=…): a proxy or CDN in front
+ * (Cloudflare caches .js and .css by default) can never serve an old script with a new page.
+ */
 function loadStatic(dir: string): Map<string, StaticFile> {
   const files = new Map<string, StaticFile>();
   for (const name of readdirSync(dir)) {
     const type = TYPES[extname(name)];
-    if (!type) continue;
-    const raw = readFileSync(join(dir, name));
-    files.set(name, {
-      type,
-      raw,
-      etag: `"${createHash('sha256').update(raw).digest('base64url').slice(0, 22)}"`,
-      br: brotliCompressSync(raw, { params: { [zc.BROTLI_PARAM_QUALITY]: 11 } }),
-      gz: gzipSync(raw, { level: 9 }),
-    });
+    if (type) files.set(name, staticFile(type, readFileSync(join(dir, name))));
+  }
+  const index = files.get('index.html');
+  if (index) {
+    let html = index.raw.toString('utf8');
+    for (const [name, f] of files) {
+      if (name !== 'index.html') html = html.replaceAll(`"/${name}"`, `"/${name}?v=${f.version}"`);
+    }
+    files.set('index.html', staticFile(index.type, Buffer.from(html, 'utf8')));
   }
   return files;
 }
@@ -743,8 +759,10 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   const files = loadStatic(publicDir);
   const serve = (name: string) => async (req: FastifyRequest, reply: FastifyReply) => {
     const f = files.get(name)!;
+    // The page is always revalidated (tiny 304s); a file asked for by its current hash never changes.
+    const versioned = (req.query as { v?: string }).v === f.version && name !== 'index.html';
     reply.header('Content-Type', f.type).header('ETag', f.etag).header('Vary', 'Accept-Encoding')
-      .header('Cache-Control', 'no-cache'); // always revalidated: tiny 304s, never a stale UI
+      .header('Cache-Control', versioned ? 'public, max-age=31536000, immutable' : 'no-cache')
     if (req.headers['if-none-match'] === f.etag) return reply.code(304).send();
     const enc = pickEncoding(req.headers['accept-encoding']);
     if (enc) reply.header('Content-Encoding', enc);

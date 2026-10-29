@@ -190,6 +190,20 @@ describe('web authentication', () => {
     assert.equal(res.headers['x-frame-options'], 'DENY');
     assert.match(String(res.headers['strict-transport-security']), /max-age=31536000/);
   });
+
+  test('page links scripts and styles by content hash, so caches never serve old ones', async () => {
+    const page = await app.inject({ url: '/' });
+    assert.equal(page.headers['cache-control'], 'no-cache');
+    const v = /src="\/app\.js\?v=([\w-]+)"/.exec(page.body)?.[1];
+    assert.ok(v, 'app.js has a version');
+    assert.match(page.body, /href="\/style\.css\?v=[\w-]+"/);
+    const js = await app.inject({ url: `/app.js?v=${v}` });
+    assert.equal(js.statusCode, 200);
+    assert.match(String(js.headers['cache-control']), /immutable/);
+    // Unknown or missing version: still served, but always revalidated.
+    assert.equal((await app.inject({ url: '/app.js?v=old' })).headers['cache-control'], 'no-cache');
+    assert.equal((await app.inject({ url: '/app.js' })).headers['cache-control'], 'no-cache');
+  });
 });
 
 // ------------------------------------------------------------------ roles and user management
