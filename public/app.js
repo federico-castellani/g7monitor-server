@@ -434,7 +434,7 @@ function showApp() {
   markPressed($('window'), 'h', String(prefs.hours));
   connectStream();
   loadReadings().catch(() => {});
-  $('avatar').textContent = me.username.slice(0, 1).toUpperCase();
+  $('avatar').textContent = me.name.slice(0, 1).toUpperCase();
   document.dispatchEvent(new Event('g7:ready'));
   showView();
 }
@@ -490,16 +490,20 @@ const EVENTS = {
   '2fa_azzerata': 'Verifica in due passaggi azzerata da',
   cambio_2fa_fallito: 'Tentativo di disattivare la verifica in due passaggi',
   sessione_chiusa: 'Browser scollegato',
+  nome_visualizzato_cambiato: 'Nome visualizzato cambiato in',
+  nome_utente_cambiato: 'Nome utente per l\'accesso cambiato in',
 };
 /** Events about access and security, for the administrators' filter. */
 const SECURITY = new Set([
   'password_errata', 'codice_2fa_errato', 'login_bloccato', 'cambio_password_fallito', 'cambio_2fa_fallito',
   '2fa_attivata', '2fa_disattivata', '2fa_azzerata', 'password_cambiata', 'password_reimpostata', 'ruolo_cambiato',
+  'nome_utente_cambiato',
 ]);
 /** Events whose detail is a name worth showing (never a user agent). */
 const WITH_DETAIL = new Set([
   'dispositivo_aggiunto', 'account_creato_da_admin', 'password_reimpostata', 'ruolo_cambiato', 'scrittura_consentita',
   'solo_lettura', 'utente_creato', 'utente_modificato', 'utente_eliminato', 'password_utente_reimpostata', '2fa_azzerata',
+  'nome_visualizzato_cambiato', 'nome_utente_cambiato',
 ]);
 
 function li(main, sub, ...buttons) {
@@ -544,7 +548,7 @@ async function loadDevices(all = false) {
       loadDevices(all);
     });
     const last = d.lastUsed ? `ultimo contatto ${dateTimeFmt.format(d.lastUsed * 1000)}` : 'mai usato';
-    const who = admin ? `${d.username} · ` : '';
+    const who = admin ? `${d.owner} · ` : '';
     return li(`${d.name} · ${reader ? 'riceve' : 'carica'}`, `${who}collegato il ${dateTimeFmt.format(d.createdAt * 1000)} · ${last}`, remove);
   }) : [emptyItem('Nessun telefono collegato')]));
 }
@@ -562,9 +566,13 @@ function renderProfile() {
   markPressed($('unit-seg'), 'unit', prefs.unit);
   $('range-low').value = prefs.low;
   $('range-high').value = prefs.high;
-  $('avatar-lg').textContent = me.username.slice(0, 1).toUpperCase();
-  $('profile-name').textContent = me.username;
+  $('avatar-lg').textContent = me.name.slice(0, 1).toUpperCase();
+  $('avatar').textContent = me.name.slice(0, 1).toUpperCase();
+  $('profile-name').textContent = me.name;
   $('account-info').textContent = roleLabel(me);
+  $('name-form').elements.displayName.value = me.displayName ?? '';
+  $('login-name').textContent = `È il nome che vedono gli altri. Per accedere usi sempre il nome utente «${me.username}».`;
+  $('name-msg').textContent = '';
   $('pw-form').elements.username.value = me.username;
   $('pw-msg').textContent = '';
   renderTwofa();
@@ -757,7 +765,7 @@ async function loadAudit() {
   $('audit').replaceChildren(...(items.length ? items.map((a) => {
     const label = EVENTS[a.event] ?? a.event;
     const what = WITH_DETAIL.has(a.event) && a.detail ? `${label} ${a.detail}` : label;
-    const item = li(`${a.username ?? 'utente eliminato'} · ${what}`, `${dateTimeFmt.format(a.at * 1000)}${a.ip ? ' · ' + a.ip : ''}`);
+    const item = li(`${a.name ?? 'utente eliminato'} · ${what}`, `${dateTimeFmt.format(a.at * 1000)}${a.ip ? ' · ' + a.ip : ''}`);
     if (SECURITY.has(a.event) && /errat|fallit|bloccat/.test(a.event)) item.classList.add('alert');
     return item;
   }) : [emptyItem('Nessun evento')]));
@@ -787,19 +795,44 @@ async function loadUsers() {
 
     const head = document.createElement('div');
     const name = document.createElement('span');
-    name.textContent = self ? `${u.username} (tu)` : u.username;
+    name.textContent = self ? `${u.name} (tu)` : u.name;
     const info = document.createElement('small');
     const last = u.lastLoginAt ? `ultimo accesso ${dateTimeFmt.format(u.lastLoginAt * 1000)}` : 'mai entrato';
-    info.textContent = [last, u.mustChangePassword ? 'password temporanea' : '', u.totp ? '2FA' : '', u.locked ? 'BLOCCATO' : '']
+    info.textContent = [`accede come ${u.username}`, last, u.mustChangePassword ? 'password temporanea' : '', u.totp ? '2FA' : '', u.locked ? 'BLOCCATO' : '']
       .filter(Boolean).join(' · ');
     head.append(name, info);
+
+    // Names: display name and the username used to log in (sessions and phones stay linked).
+    const names = document.createElement('form');
+    names.className = 'user-names';
+    names.hidden = true;
+    const dn = document.createElement('input');
+    Object.assign(dn, { value: u.displayName ?? '', maxLength: 40, placeholder: 'Nome visualizzato' });
+    const un = document.createElement('input');
+    Object.assign(un, { value: u.username, maxLength: 32, required: true, autocapitalize: 'none', spellcheck: false });
+    un.pattern = '[a-zA-Z0-9._\\-]{3,32}';
+    const save = document.createElement('button');
+    save.type = 'submit';
+    save.className = 'btn small primary';
+    save.textContent = 'Salva';
+    names.append(field('Nome visualizzato', dn), field('Nome utente per l\'accesso', un), save,
+      button('Annulla', '', () => { names.hidden = true; }));
+    names.onsubmit = (e) => {
+      e.preventDefault();
+      const body = { displayName: dn.value.trim() || null };
+      if (un.value.trim() !== u.username) {
+        if (!confirm(`Da ora "${u.name}" dovrà accedere con il nome utente "${un.value.trim()}". Continuare?`)) return;
+        body.username = un.value.trim();
+      }
+      update(u, body);
+    };
 
     const controls = document.createElement('div');
     controls.className = 'user-controls';
 
     const role = document.createElement('select');
     role.className = 'compact-select';
-    role.setAttribute('aria-label', `Ruolo di ${u.username}`);
+    role.setAttribute('aria-label', `Ruolo di ${u.name}`);
     role.innerHTML = '<option value="user">Utente</option><option value="admin">Amministratore</option>';
     role.value = u.role;
     role.disabled = self;
@@ -814,11 +847,11 @@ async function loadUsers() {
     write.onchange = () => update(u, { canWrite: write.checked });
     writeLabel.append(write, document.createTextNode(' Può caricare'));
 
-    controls.append(role, writeLabel);
+    controls.append(role, writeLabel, button('Modifica nomi', '', () => { names.hidden = !names.hidden; if (!names.hidden) dn.focus(); }));
     if (u.locked) controls.append(button('Sblocca', '', () => update(u, { unlock: true })));
     if (u.totp && !self) {
       controls.append(button('Azzera 2FA', '', () => {
-        if (confirm(`Azzerare la verifica in due passaggi di "${u.username}"? Potrà entrare con la sola password e riattivarla dal suo profilo.`)) {
+        if (confirm(`Azzerare la verifica in due passaggi di "${u.name}"? Potrà entrare con la sola password e riattivarla dal suo profilo.`)) {
           update(u, { resetTotp: true });
         }
       }));
@@ -826,35 +859,38 @@ async function loadUsers() {
     if (!self) {
       controls.append(button('Reimposta password', '', async () => {
         const pw = randomPassword();
-        if (!confirm(`Impostare per "${u.username}" la password temporanea ${pw} ?\nVerrà disconnesso ovunque e dovrà sceglierne una nuova al prossimo accesso.`)) return;
+        if (!confirm(`Impostare per "${u.name}" la password temporanea ${pw} ?\nVerrà disconnesso ovunque e dovrà sceglierne una nuova al prossimo accesso.`)) return;
         try {
           await api(`/api/admin/users/${u.id}/password`, { method: 'POST', body: { password: pw } });
-          usersMessage(`Password temporanea di ${u.username}: ${pw}`, true);
+          usersMessage(`Password temporanea di ${u.name}: ${pw} (accede come ${u.username})`, true);
           loadUsers();
         } catch (e) { usersMessage(e.message); }
       }));
       controls.append(button('Elimina', 'danger-outline', async () => {
-        if (!confirm(`Eliminare l'utente "${u.username}"? I suoi telefoni smetteranno di caricare. Le glicemie restano.`)) return;
+        if (!confirm(`Eliminare l'utente "${u.name}"? I suoi telefoni smetteranno di caricare. Le glicemie restano.`)) return;
         try {
           await api(`/api/admin/users/${u.id}`, { method: 'DELETE' });
-          usersMessage(`Utente ${u.username} eliminato`, true);
+          usersMessage(`Utente ${u.name} eliminato`, true);
           loadUsers();
         } catch (e) { usersMessage(e.message); }
       }));
     }
-    item.append(head, controls);
+    item.append(head, controls, names);
     return item;
   }));
 }
 
 async function update(u, body) {
   try {
-    await api(`/api/admin/users/${u.id}`, { method: 'PATCH', body });
-    usersMessage(`${u.username} aggiornato`, true);
+    const updated = await api(`/api/admin/users/${u.id}`, { method: 'PATCH', body });
+    usersMessage(`${updated.name} aggiornato`, true);
   } catch (e) {
     usersMessage(e.message);
   }
   loadUsers().catch(() => {});
+  loadAudit().catch(() => {});
+  // The administrator renamed their own account: the pages show the new name.
+  if (u.id === me.id) me = await api('/api/me').catch(() => me);
 }
 
 
@@ -927,6 +963,18 @@ chart.addEventListener('pointerleave', stopInspect);
 chart.addEventListener('pointercancel', stopInspect);
 new ResizeObserver(() => renderChart()).observe(chart);
 
+$('name-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = $('name-msg');
+  msg.className = 'error';
+  try {
+    me = await api('/api/me', { method: 'PATCH', body: { displayName: e.currentTarget.displayName.value.trim() || null } });
+    renderProfile();
+    msg.className = 'error ok';
+    msg.textContent = 'Nome salvato';
+  } catch (ex) { msg.textContent = ex.message; }
+});
+
 $('audit-filter').addEventListener('click', (e) => {
   const f = e.target.closest('button')?.dataset.f;
   if (!f) return;
@@ -987,13 +1035,14 @@ $('new-user').addEventListener('submit', async (e) => {
   const form = e.currentTarget;
   const body = {
     username: form.username.value.trim(),
+    displayName: form.displayName.value.trim() || null,
     password: form.password.value,
     role: form.role.value,
     canWrite: form.canWrite.checked,
   };
   try {
     await api('/api/admin/users', { method: 'POST', body });
-    usersMessage(`Utente ${body.username} creato. Password temporanea: ${body.password} (dovrà cambiarla al primo accesso)`, true);
+    usersMessage(`Utente ${body.displayName ?? body.username} creato: accede come ${body.username} con la password temporanea ${body.password} (dovrà cambiarla al primo accesso)`, true);
     form.reset();
     form.password.value = randomPassword();
     loadUsers().catch(() => {});

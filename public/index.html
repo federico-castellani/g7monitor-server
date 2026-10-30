@@ -152,6 +152,17 @@
 
     <div class="page-grid">
       <section class="card">
+        <h3>Il tuo nome</h3>
+        <form id="name-form" class="stack">
+          <label class="field"><span>Nome visualizzato</span>
+            <input name="displayName" maxlength="40" autocomplete="name" placeholder="Come vuoi essere chiamato"></label>
+          <p class="muted small" id="login-name"></p>
+          <p class="error" id="name-msg" role="status"></p>
+          <button type="submit" class="btn">Salva</button>
+        </form>
+      </section>
+
+      <section class="card">
         <h3>Visualizzazione</h3>
         <p class="muted small">Valgono per questo browser.</p>
         <div class="row">
@@ -228,7 +239,8 @@
       <section class="card">
         <h3>Nuovo utente</h3>
         <form id="new-user" class="stack" autocomplete="off">
-          <label class="field"><span>Nome utente</span><input name="username" pattern="[a-zA-Z0-9._\-]{3,32}" maxlength="32" autocapitalize="none" spellcheck="false" required></label>
+          <label class="field"><span>Nome visualizzato (facoltativo)</span><input name="displayName" maxlength="40" placeholder="Es. Mario Rossi"></label>
+          <label class="field"><span>Nome utente per l'accesso</span><input name="username" pattern="[a-zA-Z0-9._\-]{3,32}" maxlength="32" autocapitalize="none" spellcheck="false" required></label>
           <label class="field"><span>Password temporanea (dovrà cambiarla al primo accesso)</span>
             <span class="input-row"><input name="password" type="text" minlength="12" required autocomplete="off" spellcheck="false"><button type="button" class="btn small" id="gen-pw">Genera</button></span>
           </label>

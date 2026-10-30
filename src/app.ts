@@ -7,7 +7,7 @@ import { brotliCompressSync, constants as zc, createGunzip, gzipSync } from 'nod
 import Fastify from 'fastify';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Config } from './config.ts';
-import { USERNAME_RE, mayWrite, now } from './store.ts';
+import { USERNAME_RE, cleanDisplayName, mayWrite, nameOf, now } from './store.ts';
 import type { DeviceKind, FingerRow, ReadingRow, Role, Store, User } from './store.ts';
 import { authenticate } from './auth.ts';
 import type { Credentials } from './auth.ts';
@@ -189,6 +189,9 @@ function publicUser(u: User) {
   return {
     id: u.id,
     username: u.username,
+    displayName: u.displayName,
+    /** What the pages show: the display name, or the username when there is none. */
+    name: nameOf(u),
     role: u.role,
     canWrite: mayWrite(u),
     mustChangePassword: u.mustChangePassword,
@@ -245,6 +248,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     `${cookieName}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${cfg.cookieSecure ? '; Secure' : ''}`;
   const isBrowserApi = (url: string) => url.startsWith('/api/') && !url.startsWith('/api/v1/');
   const forbidden = (reply: FastifyReply, error: string, message: string) => reply.code(403).send({ error, message });
+  const BAD_USERNAME = { error: 'nome_non_valido', message: 'Nome utente: 3-32 caratteri tra lettere, numeri, . _ -' } as const;
 
   app.decorateRequest('auth', null);
   app.decorateRequest('clientIp', '');
@@ -383,6 +387,24 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
 
   app.get('/api/me', { preHandler: requireAuth }, async (req) => publicUser(req.auth!.user));
 
+  const BAD_NAME = { error: 'nome_non_valido', message: 'Nome visualizzato: al massimo 40 caratteri, senza caratteri speciali invisibili' } as const;
+  const displayNameProp = { type: ['string', 'null'], maxLength: 200 } as const;
+
+  /** The user's own display name (the username is changed only by an administrator). */
+  app.patch('/api/me', {
+    preHandler: requireAuth,
+    schema: { body: { type: 'object', required: ['displayName'], additionalProperties: false, properties: { displayName: displayNameProp } } },
+  }, async (req, reply) => {
+    const name = cleanDisplayName((req.body as { displayName: string | null }).displayName);
+    if (name === undefined) return reply.code(400).send(BAD_NAME);
+    const u = req.auth!.user;
+    if (name !== u.displayName) {
+      store.setDisplayName(u.id, name);
+      store.audit(u.id, 'nome_visualizzato_cambiato', req.clientIp, name ?? u.username);
+    }
+    return publicUser(store.userById(u.id)!);
+  });
+
   app.post('/api/me/password', {
     preHandler: requireAuth,
     schema: {
@@ -500,7 +522,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   app.get('/api/devices', { preHandler: requireAuth }, async (req) => {
     const u = req.auth!.user;
     return store.listDevices(u.role === 'admin' ? null : u.id)
-      .map(({ id, kind, name, createdAt, lastUsed, username }) => ({ id, kind, name, createdAt, lastUsed, username }));
+      .map(({ id, kind, name, createdAt, lastUsed, username, owner }) => ({ id, kind, name, createdAt, lastUsed, username, owner }));
   });
 
   app.delete('/api/devices/:id', { preHandler: requireAuth, schema: { params: idParams } }, async (req, reply) => {
@@ -624,6 +646,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
         type: 'object', required: ['username', 'password', 'role', 'canWrite'], additionalProperties: false,
         properties: {
           username: { type: 'string', maxLength: 32 },
+          displayName: displayNameProp,
           password: { type: 'string', maxLength: 1024 },
           role: { type: 'string', enum: ['admin', 'user'] },
           canWrite: { type: 'boolean' },
@@ -631,17 +654,19 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
       },
     },
   }, async (req, reply) => {
-    const b = req.body as { username: string; password: string; role: Role; canWrite: boolean };
-    if (!USERNAME_RE.test(b.username)) return reply.code(400).send({ error: 'nome_non_valido', message: 'Nome utente: 3-32 caratteri tra lettere, numeri, . _ -' });
+    const b = req.body as { username: string; password: string; role: Role; canWrite: boolean; displayName?: string | null };
+    if (!USERNAME_RE.test(b.username)) return reply.code(400).send(BAD_USERNAME);
+    const displayName = cleanDisplayName(b.displayName ?? null);
+    if (displayName === undefined) return reply.code(400).send(BAD_NAME);
     if (store.userByName(b.username)) return reply.code(409).send({ error: 'nome_esistente', message: 'Esiste già un utente con questo nome' });
     const problem = passwordProblem(b.password, b.username);
     if (problem) return reply.code(400).send({ error: 'password_debole', message: problem });
     const id = store.createUser(b.username, await hashPassword(b.password, cfg.pepper), {
-      role: b.role, canWrite: b.canWrite, mustChangePassword: true,
+      role: b.role, canWrite: b.canWrite, mustChangePassword: true, displayName,
     });
     const admin = req.auth!.user;
-    store.audit(admin.id, 'utente_creato', req.clientIp, b.username);
-    store.audit(id, 'account_creato_da_admin', null, admin.username);
+    store.audit(admin.id, 'utente_creato', req.clientIp, displayName ? `${displayName} (${b.username})` : b.username);
+    store.audit(id, 'account_creato_da_admin', null, nameOf(admin));
     return reply.code(201).send(publicUser(store.userById(id)!));
   });
 
@@ -653,6 +678,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
         type: 'object', additionalProperties: false, minProperties: 1,
         properties: {
           role: { type: 'string', enum: ['admin', 'user'] }, canWrite: { type: 'boolean' }, unlock: { type: 'boolean' },
+          username: { type: 'string', maxLength: 32 }, displayName: displayNameProp,
           // a user who lost the phone with the authenticator app
           resetTotp: { type: 'boolean', const: true },
         },
@@ -660,10 +686,17 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     },
   }, async (req, reply) => {
     const { id } = req.params as { id: number };
-    const b = req.body as { role?: Role; canWrite?: boolean; unlock?: boolean; resetTotp?: true };
+    const b = req.body as { role?: Role; canWrite?: boolean; unlock?: boolean; resetTotp?: true; username?: string; displayName?: string | null };
     const admin = req.auth!.user;
     const target = store.userById(id);
     if (!target) return reply.code(404).send({ error: 'non_trovato', message: 'Utente non trovato' });
+    if (b.username !== undefined && !USERNAME_RE.test(b.username)) return reply.code(400).send(BAD_USERNAME);
+    const displayName = b.displayName === undefined ? target.displayName : cleanDisplayName(b.displayName);
+    if (displayName === undefined) return reply.code(400).send(BAD_NAME);
+    if (b.username !== undefined && b.username !== target.username) {
+      const other = store.userByName(b.username);
+      if (other && other.id !== target.id) return reply.code(409).send({ error: 'nome_esistente', message: 'Esiste già un utente con questo nome' });
+    }
     if (b.role === 'user' && target.role === 'admin') {
       if (target.id === admin.id) return reply.code(400).send({ error: 'operazione_non_consentita', message: 'Non puoi togliere a te stesso il ruolo di amministratore' });
       if (store.countAdmins() <= 1) return reply.code(400).send({ error: 'ultimo_admin', message: 'Deve restare almeno un amministratore' });
@@ -671,19 +704,25 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     store.transaction(() => {
       if (b.role && b.role !== target.role) {
         store.setRole(id, b.role);
-        store.audit(id, 'ruolo_cambiato', null, `${b.role} (da ${admin.username})`);
+        store.audit(id, 'ruolo_cambiato', null, `${b.role} (da ${nameOf(admin)})`);
       }
       if (b.canWrite !== undefined && b.canWrite !== target.canWrite) {
         store.setCanWrite(id, b.canWrite);
-        store.audit(id, b.canWrite ? 'scrittura_consentita' : 'solo_lettura', null, admin.username);
+        store.audit(id, b.canWrite ? 'scrittura_consentita' : 'solo_lettura', null, nameOf(admin));
       }
       if (b.unlock) store.unlock(id);
       if (b.resetTotp && target.totpSecret) {
         store.setTotp(id, null);
-        store.audit(id, '2fa_azzerata', null, admin.username);
+        store.audit(id, '2fa_azzerata', null, nameOf(admin));
       }
+      // Logging in changes for the user: sessions and phones go on (they refer to the account, not the name).
+      if (b.username !== undefined && b.username !== target.username) {
+        store.setUsername(id, b.username);
+        store.audit(id, 'nome_utente_cambiato', null, `${b.username} (da ${nameOf(admin)})`);
+      }
+      if (displayName !== target.displayName) store.setDisplayName(id, displayName);
     });
-    store.audit(admin.id, 'utente_modificato', req.clientIp, target.username);
+    store.audit(admin.id, 'utente_modificato', req.clientIp, nameOf(store.userById(id)!));
     return publicUser(store.userById(id)!);
   });
 
@@ -705,8 +744,8 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     if (problem) return reply.code(400).send({ error: 'password_debole', message: problem });
     store.setPassword(id, await hashPassword(password, cfg.pepper), true);
     store.deleteUserSessions(id);
-    store.audit(id, 'password_reimpostata', null, admin.username);
-    store.audit(admin.id, 'password_utente_reimpostata', req.clientIp, target.username);
+    store.audit(id, 'password_reimpostata', null, nameOf(admin));
+    store.audit(admin.id, 'password_utente_reimpostata', req.clientIp, nameOf(target));
     return reply.code(204).send();
   });
 
@@ -717,7 +756,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     if (!target) return reply.code(404).send({ error: 'non_trovato', message: 'Utente non trovato' });
     if (target.id === admin.id) return reply.code(400).send({ error: 'operazione_non_consentita', message: 'Non puoi eliminare il tuo account' });
     store.deleteUser(id); // sessions and phones go with it; readings stay
-    store.audit(admin.id, 'utente_eliminato', req.clientIp, target.username);
+    store.audit(admin.id, 'utente_eliminato', req.clientIp, nameOf(target));
     return reply.code(204).send();
   });
 
@@ -758,7 +797,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     const token = newToken(DEVICE_TOKEN_PREFIX);
     store.createDevice(r.user.id, kind, body.name.trim() || 'Telefono', sha256(token));
     store.audit(r.user.id, 'dispositivo_aggiunto', req.clientIp, body.name.slice(0, 60));
-    return reply.code(201).send({ token, username: r.user.username, last: store.readingStats().last });
+    return reply.code(201).send({ token, username: r.user.username, displayName: nameOf(r.user), last: store.readingStats().last });
   });
 
   /** "Scollega" in the app: the phone revokes its own token (allowed even without write permission). */
@@ -770,7 +809,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
 
   app.get('/api/v1/status', { preHandler: requireDevice }, async (req) => {
     const u = store.userById(req.deviceUser!)!;
-    return { username: u.username, last: store.readingStats().last };
+    return { username: u.username, displayName: nameOf(u), last: store.readingStats().last };
   });
 
   /**

@@ -6,9 +6,23 @@ export type Role = 'admin' | 'user';
 
 export const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/;
 
+/**
+ * A display name as typed (null = none): trimmed, 1–40 characters, no control or invisible
+ * formatting characters. @returns the name, or undefined if it is not acceptable.
+ */
+export function cleanDisplayName(raw: string | null): string | null | undefined {
+  if (raw === null) return null;
+  const v = raw.normalize('NFC').trim().replace(/\s+/g, ' ');
+  if (!v) return null;
+  if ([...v].length > 40 || /[\p{Cc}\p{Cf}]/u.test(v)) return undefined;
+  return v;
+}
+
 export interface User {
   id: number;
   username: string;
+  /** Shown in the pages instead of the username (which is only for logging in); null = the username. */
+  displayName: string | null;
   passwordHash: string;
   role: Role;
   canWrite: boolean;
@@ -20,6 +34,9 @@ export interface User {
   createdAt: number;
   lastLoginAt: number | null;
 }
+
+/** The name the pages show. */
+export const nameOf = (u: Pick<User, 'username' | 'displayName'>): string => u.displayName ?? u.username;
 
 /** Admins can always upload; normal users only when an admin allowed it. */
 export const mayWrite = (u: Pick<User, 'role' | 'canWrite'>): boolean => u.role === 'admin' || u.canWrite;
@@ -53,6 +70,7 @@ function toUser(r: Row | undefined): User | null {
   return {
     id: Number(r.id),
     username: String(r.username),
+    displayName: (r.display_name as string | null) ?? null,
     passwordHash: String(r.password_hash),
     role: r.role === 'admin' ? 'admin' : 'user',
     canWrite: Boolean(r.can_write),
@@ -98,13 +116,28 @@ export class Store {
 
   // ------------------------------------------------------------------ users
 
-  createUser(username: string, passwordHash: string, opts: { role?: Role; canWrite?: boolean; mustChangePassword?: boolean } = {}): number {
+  createUser(
+    username: string, passwordHash: string,
+    opts: { role?: Role; canWrite?: boolean; mustChangePassword?: boolean; displayName?: string | null } = {},
+  ): number {
     const t = now();
     const r = this.q(`
-      INSERT INTO users (username, password_hash, role, can_write, must_change_password, created_at, password_changed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(username, passwordHash, opts.role ?? 'user', opts.canWrite ? 1 : 0, opts.mustChangePassword ? 1 : 0, t, t);
+      INSERT INTO users (username, display_name, password_hash, role, can_write, must_change_password, created_at, password_changed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(username, opts.displayName ?? null, passwordHash, opts.role ?? 'user', opts.canWrite ? 1 : 0, opts.mustChangePassword ? 1 : 0, t, t);
     return Number(r.lastInsertRowid);
+  }
+
+  /** @returns false if another account already uses that username (case-insensitive). */
+  setUsername(id: number, username: string): boolean {
+    const other = this.userByName(username);
+    if (other && other.id !== id) return false;
+    this.q('UPDATE users SET username = ? WHERE id = ?').run(username, id);
+    return true;
+  }
+
+  setDisplayName(id: number, name: string | null): void {
+    this.q('UPDATE users SET display_name = ? WHERE id = ?').run(name, id);
   }
 
   userByName(username: string): User | null {
@@ -116,7 +149,7 @@ export class Store {
   }
 
   listUsers(): User[] {
-    return (this.q('SELECT * FROM users ORDER BY role, username').all() as Row[]).map((r) => toUser(r)!);
+    return (this.q('SELECT * FROM users ORDER BY role, COALESCE(display_name, username) COLLATE NOCASE').all() as Row[]).map((r) => toUser(r)!);
   }
 
   countUsers(): number {
@@ -275,13 +308,15 @@ export class Store {
   }
 
   /** userId null = every device (admin view). */
-  listDevices(userId: number | null): (Device & { lastIp: string | null; username: string })[] {
+  listDevices(userId: number | null): (Device & { lastIp: string | null; username: string; owner: string })[] {
+    const select = 'SELECT d.*, u.username, COALESCE(u.display_name, u.username) AS owner FROM devices d JOIN users u ON u.id = d.user_id';
     const rows = userId === null
-      ? this.q(`SELECT d.*, u.username FROM devices d JOIN users u ON u.id = d.user_id ORDER BY d.created_at DESC, d.id DESC`).all()
-      : this.q(`SELECT d.*, u.username FROM devices d JOIN users u ON u.id = d.user_id WHERE d.user_id = ? ORDER BY d.created_at DESC, d.id DESC`).all(userId);
+      ? this.q(`${select} ORDER BY d.created_at DESC, d.id DESC`).all()
+      : this.q(`${select} WHERE d.user_id = ? ORDER BY d.created_at DESC, d.id DESC`).all(userId);
     return (rows as Row[]).map((r) => ({
       id: Number(r.id), userId: Number(r.user_id), kind: r.kind === 'reader' ? 'reader' : 'uploader', name: String(r.name),
-      createdAt: Number(r.created_at), lastUsed: num(r.last_used), lastIp: (r.last_ip as string | null) ?? null, username: String(r.username),
+      createdAt: Number(r.created_at), lastUsed: num(r.last_used), lastIp: (r.last_ip as string | null) ?? null,
+      username: String(r.username), owner: String(r.owner),
     }));
   }
 
@@ -380,12 +415,12 @@ export class Store {
   }
 
   /** Everyone's events, newest first, for the administrators. */
-  allAudit(limit = 150): { at: number; event: string; ip: string | null; detail: string | null; username: string | null }[] {
-    return (this.q(`SELECT a.at, a.event, a.ip, a.detail, u.username FROM audit a LEFT JOIN users u ON u.id = a.user_id
-      ORDER BY a.at DESC, a.id DESC LIMIT ?`).all(limit) as Row[])
+  allAudit(limit = 150): { at: number; event: string; ip: string | null; detail: string | null; username: string | null; name: string | null }[] {
+    return (this.q(`SELECT a.at, a.event, a.ip, a.detail, u.username, COALESCE(u.display_name, u.username) AS name
+      FROM audit a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.at DESC, a.id DESC LIMIT ?`).all(limit) as Row[])
       .map((r) => ({
         at: Number(r.at), event: String(r.event), ip: (r.ip as string | null) ?? null,
-        detail: (r.detail as string | null) ?? null, username: (r.username as string | null) ?? null,
+        detail: (r.detail as string | null) ?? null, username: (r.username as string | null) ?? null, name: (r.name as string | null) ?? null,
       }));
   }
 

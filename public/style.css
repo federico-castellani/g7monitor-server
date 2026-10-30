@@ -327,6 +327,9 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .list.users { margin: 4px 0 8px; }
 .list li.user { flex-direction: column; align-items: stretch; gap: 10px; }
 .user-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.user-names { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 8px; align-items: end; }
+.user-names input { padding: 8px 10px; }
+@media (max-width: 560px) { .user-names { grid-template-columns: 1fr 1fr; } }
 .compact-select { width: auto; padding: 6px 10px; font-size: 14px; }
 .check { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
 .check input { width: 18px; height: 18px; padding: 0; accent-color: var(--primary); }

@@ -652,3 +652,61 @@ describe('profile and administration', () => {
     assert.equal(store.userById(id)!.totpSecret, null);
   });
 });
+
+// ------------------------------------------------------------------ display names and renaming
+
+describe('names', () => {
+  test('a user sets a display name: the pages show it, logging in still needs the username', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'eva');
+    const { cookie } = await login(app, 'eva');
+    const me = (await web(app, cookie, 'PATCH', '/api/me', { displayName: '  Eva   Rossi ' })).json();
+    assert.equal(me.displayName, 'Eva Rossi');
+    assert.equal(me.name, 'Eva Rossi');
+    assert.equal(me.username, 'eva');
+    assert.equal((await login(app, 'Eva Rossi')).res.statusCode, 401);
+    assert.equal((await login(app, 'eva')).res.statusCode, 200);
+    // too long, or invisible characters: refused; empty: back to the username
+    assert.equal((await web(app, cookie, 'PATCH', '/api/me', { displayName: 'x'.repeat(41) })).statusCode, 400);
+    assert.equal((await web(app, cookie, 'PATCH', '/api/me', { displayName: 'Eva‮Rossi' })).statusCode, 400);
+    assert.equal((await web(app, cookie, 'PATCH', '/api/me', { displayName: '' })).json().name, 'eva');
+  });
+
+  test('an administrator renames a user: new username to log in, sessions and phones keep working', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'admin', 'admin');
+    const id = await addUser(store, 'franco', 'user', true);
+    await addUser(store, 'gina');
+    const user = await login(app, 'franco');
+    const { cookie } = await login(app, 'admin');
+    const pair = await app.inject({ method: 'POST', url: '/api/v1/devices', payload: { username: 'franco', password: PASSWORD, name: 'Telefono' } });
+    const token = pair.json().token as string;
+
+    assert.equal((await web(app, cookie, 'PATCH', `/api/admin/users/${id}`, { username: 'GINA' })).statusCode, 409);
+    assert.equal((await web(app, cookie, 'PATCH', `/api/admin/users/${id}`, { username: 'no spazi' })).statusCode, 400);
+    const res = await web(app, cookie, 'PATCH', `/api/admin/users/${id}`, { username: 'franco.b', displayName: 'Franco Bianchi' });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.json().name, 'Franco Bianchi');
+
+    assert.equal((await login(app, 'franco')).res.statusCode, 401);
+    assert.equal((await login(app, 'franco.b')).res.statusCode, 200);
+    assert.equal((await web(app, user.cookie, 'GET', '/api/me')).json().username, 'franco.b'); // still logged in
+    const status = await app.inject({ url: '/api/v1/status', headers: { authorization: `Bearer ${token}` } });
+    assert.equal(status.json().displayName, 'Franco Bianchi'); // the phone too
+    const devices = (await web(app, cookie, 'GET', '/api/devices')).json() as { owner: string }[];
+    assert.equal(devices[0].owner, 'Franco Bianchi');
+    const audit = (await web(app, user.cookie, 'GET', '/api/activity')).json() as { event: string }[];
+    assert.ok(audit.some((a) => a.event === 'nome_utente_cambiato'));
+  });
+
+  test('a new account can be created with its display name', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'admin', 'admin');
+    const { cookie } = await login(app, 'admin');
+    const res = await web(app, cookie, 'POST', '/api/admin/users', {
+      username: 'hugo', displayName: 'Hugo Verdi', password: 'cielo-sereno-sul-lago-blu', role: 'user', canWrite: false,
+    });
+    assert.equal(res.statusCode, 201);
+    assert.equal(res.json().name, 'Hugo Verdi');
+  });
+});

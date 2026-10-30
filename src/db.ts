@@ -87,6 +87,10 @@ const MIGRATIONS = [
   ) STRICT;
   CREATE INDEX fingersticks_ts ON fingersticks(ts);
   `,
+  // 3: name shown in the web pages; the username is only for logging in
+  `
+  ALTER TABLE users ADD COLUMN display_name TEXT;
+  `,
 ];
 
 export function openDb(path: string): DatabaseSync {
