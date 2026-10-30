@@ -9,7 +9,45 @@ const PARAMS = { memory: 65536, passes: 3, parallelism: 4, tagLength: 32 };
 
 interface Params { memory: number; passes: number; parallelism: number; tagLength: number }
 
+/** Too many password checks waiting: the request is refused at once (HTTP 429). */
+export class BusyError extends Error {
+  readonly statusCode = 429;
+  constructor() {
+    super('Server occupato: riprova tra qualche secondo');
+  }
+}
+
+/**
+ * Each hash takes 64 MiB and a CPU core for a fraction of a second. A flood of login attempts
+ * must not use up the server: at most [MAX_RUNNING] at a time, a short queue, the rest refused.
+ */
+const MAX_RUNNING = 2;
+const MAX_QUEUED = 8;
+let running = 0;
+const queue: Array<() => void> = [];
+
+async function limited<T>(work: () => Promise<T>): Promise<T> {
+  if (running >= MAX_RUNNING) {
+    if (queue.length >= MAX_QUEUED) throw new BusyError();
+    await new Promise<void>((resolve) => queue.push(resolve));
+  } else {
+    running++;
+  }
+  try {
+    return await work();
+  } finally {
+    // Hand the slot straight to the next waiter, or free it.
+    const next = queue.shift();
+    if (next) next();
+    else running--;
+  }
+}
+
 function derive(password: string, salt: Buffer, p: Params, pepper: Buffer | null): Promise<Buffer> {
+  return limited(() => deriveNow(password, salt, p, pepper));
+}
+
+function deriveNow(password: string, salt: Buffer, p: Params, pepper: Buffer | null): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     argon2('argon2id', {
       // NFKC: the same password typed on different keyboards/OSes gives the same bytes.

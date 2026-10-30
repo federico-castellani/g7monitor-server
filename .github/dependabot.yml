@@ -1,0 +1,7 @@
+# Keeps the GitHub Actions (pinned to exact commits in the workflows) up to date, once a week.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

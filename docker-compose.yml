@@ -14,7 +14,10 @@ services:
     restart: unless-stopped
     environment:
       G7_ORIGIN: ${G7_DOMAIN:?imposta G7_DOMAIN nel file .env} # with or without https://
-      G7_TRUST_PROXY: "true" # the port is published on localhost only: every request comes from the proxy
+      # The port is published on localhost only: every request comes through your reverse proxy.
+      G7_TRUST_PROXY: "true"
+      # Behind Cloudflare: CF-Connecting-IP holds the visitor's real address (see .env).
+      G7_CLIENT_IP_HEADER: ${G7_CLIENT_IP_HEADER:-}
       G7_PEPPER: ${G7_PEPPER:-}
     ports:
       - "127.0.0.1:${G7_PORT:-8080}:8080"

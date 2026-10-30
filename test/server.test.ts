@@ -3,7 +3,7 @@ import { gzipSync } from 'node:zlib';
 import { before, describe, test } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.ts';
-import { normalizeOrigin } from '../src/config.ts';
+import { normalizeOrigin, parseTrustProxy } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
 import { openDb } from '../src/db.ts';
 import { Store } from '../src/store.ts';
@@ -16,12 +16,12 @@ const PASSWORD = 'cavallo-batteria-graffetta';
 
 const cfg: Config = {
   host: '127.0.0.1', port: 0, dbPath: ':memory:', publicOrigin: ORIGIN,
-  cookieSecure: true, trustProxy: false, pepper: Buffer.from('p'.repeat(32)),
+  cookieSecure: true, trustProxy: false, clientIpHeader: null, pepper: Buffer.from('p'.repeat(32)),
 };
 
-function setup() {
+function setup(overrides: Partial<Config> = {}) {
   const store = new Store(openDb(':memory:'));
-  const app = buildApp(cfg, store, { logger: false });
+  const app = buildApp({ ...cfg, ...overrides }, store, { logger: false });
   return { store, app };
 }
 
@@ -405,7 +405,7 @@ describe('upload', () => {
 
   test('public info lets the app recognise the server', async () => {
     const res = await app.inject({ url: '/api/v1/info' });
-    assert.deepEqual(res.json(), { service: 'g7monitor', api: 1, version: 'dev' });
+    assert.deepEqual(res.json(), { service: 'g7monitor', api: 1 });
   });
 
   test('follower polling returns only newer readings, oldest first', async () => {
@@ -522,5 +522,71 @@ describe('fingersticks', () => {
       abort.abort();
       await app.close();
     }
+  });
+});
+
+// ------------------------------------------------------------------ hardening (vulnerability assessment)
+
+describe('hardening', () => {
+  test('trust proxy: "true" trusts only local proxies, never "anything"', () => {
+    assert.equal(parseTrustProxy(undefined), false);
+    assert.equal(parseTrustProxy(''), false);
+    assert.equal(parseTrustProxy('true'), 'loopback, linklocal, uniquelocal');
+    assert.equal(parseTrustProxy('1'), 'loopback, linklocal, uniquelocal');
+    assert.equal(parseTrustProxy('10.0.0.1, 10.0.0.2'), '10.0.0.1, 10.0.0.2');
+  });
+
+  test('a forged X-Forwarded-For does not escape the per-IP throttling', async () => {
+    const { app, store } = setup({ trustProxy: parseTrustProxy('true') });
+    for (let i = 0; i < 20; i++) store.recordIpFailure('198.51.100.7');
+    const res = await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: '127.0.0.1',
+      headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.99, 198.51.100.7' },
+      payload: { username: 'x', password: 'y' },
+    });
+    assert.equal(res.statusCode, 429);
+  });
+
+  test('the CDN header gives the real address, but only on requests that came through the proxy', async () => {
+    const { app, store } = setup({ trustProxy: parseTrustProxy('true'), clientIpHeader: 'cf-connecting-ip' });
+    for (let i = 0; i < 20; i++) store.recordIpFailure('198.51.100.8');
+    const attempt = (headers: Record<string, string>) => app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: '127.0.0.1',
+      headers: { origin: ORIGIN, 'cf-connecting-ip': '198.51.100.8', ...headers },
+      payload: { username: 'x', password: 'y' },
+    });
+    assert.equal((await attempt({ 'x-forwarded-for': '162.158.1.1' })).statusCode, 429);
+    // Not proxied: the header is ignored (anyone could write it).
+    assert.equal((await attempt({})).statusCode, 401);
+  });
+
+  test('a flood of logins is refused quickly instead of queueing password hashes', async () => {
+    const { app } = setup();
+    const results = await Promise.all(Array.from({ length: 16 }, (_, i) => app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: `192.0.2.${i + 1}`,
+      headers: { origin: ORIGIN }, payload: { username: `utente${i}`, password: 'sbagliata-sbagliata' },
+    })));
+    const busy = results.filter((r) => r.statusCode === 429);
+    assert.ok(busy.length >= 1, 'some requests refused');
+    assert.equal(busy[0].json().error, 'server_occupato');
+    assert.ok(results.every((r) => r.statusCode === 401 || r.statusCode === 429));
+  });
+
+  test('uploads check the token before reading the body', async () => {
+    const { app } = setup();
+    const res = await app.inject({
+      method: 'POST', url: '/api/v1/readings',
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      payload: gzipSync(Buffer.from('{"b":1700000000,"r":[]}')),
+    });
+    assert.equal(res.statusCode, 401);
+  });
+
+  test('the exact version is shown only to local checks', async () => {
+    const { app } = setup();
+    assert.ok('version' in (await app.inject({ url: '/healthz', remoteAddress: '127.0.0.1' })).json());
+    assert.deepEqual((await app.inject({ url: '/healthz', remoteAddress: '203.0.113.5' })).json(), { ok: true });
+    const proxied = await app.inject({ url: '/healthz', remoteAddress: '127.0.0.1', headers: { 'x-forwarded-for': '203.0.113.5' } });
+    assert.deepEqual(proxied.json(), { ok: true });
   });
 });

@@ -34,6 +34,8 @@ interface Auth { tokenHash: Buffer; user: User }
 declare module 'fastify' {
   interface FastifyRequest {
     auth: Auth | null;
+    /** Address used for throttling and the activity log (see clientIpOf). */
+    clientIp: string;
     deviceId: number | null;
     deviceUser: number | null;
     deviceKind: DeviceKind | null;
@@ -193,6 +195,21 @@ function publicUser(u: User) {
   };
 }
 
+/** A plain IPv4 or IPv6 address, nothing else (header values are attacker-controlled). */
+const IP_RE = /^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]{2,39})$/i;
+
+/**
+ * The client's address. Fastify already resolves X-Forwarded-For through the trusted hops; with a
+ * CDN in front (Cloudflare), its header holds the real address, but only proxied requests may set it.
+ */
+function clientIpOf(req: FastifyRequest, header: string | null): string {
+  if (header && req.ips && req.ips.length > 1) {
+    const v = req.headers[header];
+    if (typeof v === 'string' && IP_RE.test(v.trim())) return v.trim();
+  }
+  return req.ip;
+}
+
 // ---------------------------------------------------------------------- schemas
 
 const credentialsProps = {
@@ -229,9 +246,14 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   const forbidden = (reply: FastifyReply, error: string, message: string) => reply.code(403).send({ error, message });
 
   app.decorateRequest('auth', null);
+  app.decorateRequest('clientIp', '');
   app.decorateRequest('deviceId', null);
   app.decorateRequest('deviceUser', null);
   app.decorateRequest('deviceKind', null);
+
+  app.addHook('onRequest', async (req) => {
+    req.clientIp = clientIpOf(req, cfg.clientIpHeader);
+  });
 
   // ----- browser session + CSRF protection
   app.addHook('onRequest', async (req, reply) => {
@@ -285,7 +307,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     req.deviceId = device.id;
     req.deviceUser = device.userId;
     req.deviceKind = device.kind;
-    store.touchDevice(device.id, req.ip);
+    store.touchDevice(device.id, req.clientIp);
   };
 
   /** Upload token of an account allowed to write: checked on every request, so revoking the permission is immediate. */
@@ -324,7 +346,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     const status = err.statusCode && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 500;
     if (status === 500) req.log.error(err);
     return reply.code(status).send({
-      error: status === 413 ? 'troppo_grande' : status === 500 ? 'errore_interno' : 'richiesta_non_valida',
+      error: status === 413 ? 'troppo_grande' : status === 429 ? 'server_occupato' : status === 500 ? 'errore_interno' : 'richiesta_non_valida',
       message: status === 500 ? 'Errore interno del server' : err.message,
     });
   });
@@ -332,20 +354,22 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   app.setNotFoundHandler((req, reply) =>
     reply.code(404).send(req.url.startsWith('/api/') ? { error: 'non_trovato', message: 'Non trovato' } : 'Non trovato'));
 
-  app.get('/healthz', async () => ({ ok: true, version: VERSION }));
+  // The exact version helps an attacker pick known bugs: only local checks (update.sh, Docker) see it.
+  const isLocal = (req: FastifyRequest) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '');
+  app.get('/healthz', async (req) => (isLocal(req) && !req.headers['x-forwarded-for'] ? { ok: true, version: VERSION } : { ok: true }));
 
   // ================================================================ web: authentication and account
 
   app.post('/api/auth/login', {
     schema: { body: { type: 'object', required: ['username', 'password'], additionalProperties: false, properties: credentialsProps } },
   }, async (req, reply) => {
-    const r = await authenticate(store, cfg.pepper, req.body as Credentials, req.ip);
+    const r = await authenticate(store, cfg.pepper, req.body as Credentials, req.clientIp);
     if (!r.ok) return reply.code(r.status).send({ error: r.error, message: r.message });
     if (req.auth) store.deleteSession(req.auth.tokenHash); // never reuse a session id across logins
     const token = newToken();
     const ua = String(req.headers['user-agent'] ?? '');
-    store.createSession(sha256(token), r.user.id, req.ip, ua);
-    store.audit(r.user.id, 'accesso_web', req.ip, ua.slice(0, 120));
+    store.createSession(sha256(token), r.user.id, req.clientIp, ua);
+    store.audit(r.user.id, 'accesso_web', req.clientIp, ua.slice(0, 120));
     reply.header('Set-Cookie', sessionCookie(token, SESSION_MAX));
     return publicUser(r.user);
   });
@@ -369,10 +393,10 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   }, async (req, reply) => {
     const { current, next } = req.body as { current: string; next: string };
     const u = req.auth!.user;
-    if (store.ipBlocked(req.ip)) return reply.code(429).send({ error: 'troppi_tentativi', message: 'Troppi tentativi: riprova tra qualche minuto' });
+    if (store.ipBlocked(req.clientIp)) return reply.code(429).send({ error: 'troppi_tentativi', message: 'Troppi tentativi: riprova tra qualche minuto' });
     if (!(await verifyPassword(u.passwordHash, current, cfg.pepper)).ok) {
-      store.recordIpFailure(req.ip);
-      store.audit(u.id, 'cambio_password_fallito', req.ip);
+      store.recordIpFailure(req.clientIp);
+      store.audit(u.id, 'cambio_password_fallito', req.clientIp);
       return reply.code(400).send({ error: 'password_errata', message: 'La password attuale non è corretta' });
     }
     if (next === current) return reply.code(400).send({ error: 'password_uguale', message: 'La nuova password deve essere diversa da quella attuale' });
@@ -380,13 +404,13 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     if (problem) return reply.code(400).send({ error: 'password_debole', message: problem });
     store.setPassword(u.id, await hashPassword(next, cfg.pepper));
     store.deleteUserSessions(u.id, req.auth!.tokenHash); // other browsers must log in again
-    store.audit(u.id, 'password_cambiata', req.ip);
+    store.audit(u.id, 'password_cambiata', req.clientIp);
     return publicUser(store.userById(u.id)!);
   });
 
   app.post('/api/me/logout-all', { preHandler: requireAuth }, async (req, reply) => {
     store.deleteUserSessions(req.auth!.user.id);
-    store.audit(req.auth!.user.id, 'disconnessione_ovunque', req.ip);
+    store.audit(req.auth!.user.id, 'disconnessione_ovunque', req.clientIp);
     reply.header('Set-Cookie', sessionCookie('', 0));
     return reply.code(204).send();
   });
@@ -404,7 +428,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     const { id } = req.params as { id: number };
     const u = req.auth!.user;
     if (!store.deleteDevice(id, u.role === 'admin' ? null : u.id)) return reply.code(404).send({ error: 'non_trovato', message: 'Dispositivo non trovato' });
-    store.audit(u.id, 'dispositivo_rimosso', req.ip, String(id));
+    store.audit(u.id, 'dispositivo_rimosso', req.clientIp, String(id));
     return reply.code(204).send();
   });
 
@@ -488,7 +512,12 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   app.get('/api/readings/stream', { preHandler: requireAuth }, (req, reply) => {
     if (hub.size >= MAX_STREAMS) return reply.code(429).send({ error: 'troppe_connessioni', message: 'Troppe connessioni aperte' });
     const token = req.auth!.tokenHash;
-    openStream(req, reply, { idlePingMs: 25_000, stillValid: () => !!store.session(token), fingersticks: [] });
+    const stillValid = () => {
+      const s = store.session(token);
+      const t = now();
+      return !!s && s.createdAt >= t - SESSION_MAX && s.lastSeen >= t - SESSION_IDLE;
+    };
+    openStream(req, reply, { idlePingMs: 25_000, stillValid, fingersticks: [] });
   });
 
   // ================================================================ web: user management (admins)
@@ -526,7 +555,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
       role: b.role, canWrite: b.canWrite, mustChangePassword: true,
     });
     const admin = req.auth!.user;
-    store.audit(admin.id, 'utente_creato', req.ip, b.username);
+    store.audit(admin.id, 'utente_creato', req.clientIp, b.username);
     store.audit(id, 'account_creato_da_admin', null, admin.username);
     return reply.code(201).send(publicUser(store.userById(id)!));
   });
@@ -561,7 +590,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
       }
       if (b.unlock) store.unlock(id);
     });
-    store.audit(admin.id, 'utente_modificato', req.ip, target.username);
+    store.audit(admin.id, 'utente_modificato', req.clientIp, target.username);
     return publicUser(store.userById(id)!);
   });
 
@@ -584,7 +613,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     store.setPassword(id, await hashPassword(password, cfg.pepper), true);
     store.deleteUserSessions(id);
     store.audit(id, 'password_reimpostata', null, admin.username);
-    store.audit(admin.id, 'password_utente_reimpostata', req.ip, target.username);
+    store.audit(admin.id, 'password_utente_reimpostata', req.clientIp, target.username);
     return reply.code(204).send();
   });
 
@@ -595,14 +624,14 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     if (!target) return reply.code(404).send({ error: 'non_trovato', message: 'Utente non trovato' });
     if (target.id === admin.id) return reply.code(400).send({ error: 'operazione_non_consentita', message: 'Non puoi eliminare il tuo account' });
     store.deleteUser(id); // sessions and phones go with it; readings stay
-    store.audit(admin.id, 'utente_eliminato', req.ip, target.username);
+    store.audit(admin.id, 'utente_eliminato', req.clientIp, target.username);
     return reply.code(204).send();
   });
 
   // ================================================================ app (device) API
 
   /** Public: lets the app check that an address really is a G7 Monitor server before asking for credentials. */
-  app.get('/api/v1/info', async () => ({ service: 'g7monitor', api: 1, version: VERSION }));
+  app.get('/api/v1/info', async () => ({ service: 'g7monitor', api: 1 }));
 
   /**
    * Pairs a phone: the app sends the user's credentials once and keeps only the returned token.
@@ -622,7 +651,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   }, async (req, reply) => {
     const body = req.body as Credentials & { name: string; kind?: DeviceKind };
     const kind = body.kind ?? 'uploader';
-    const r = await authenticate(store, cfg.pepper, body, req.ip);
+    const r = await authenticate(store, cfg.pepper, body, req.clientIp);
     if (!r.ok) return reply.code(r.status).send({ error: r.error, message: r.message });
     if (r.user.mustChangePassword) {
       return forbidden(reply, 'cambio_password_richiesto', 'Accedi prima al sito e scegli una nuova password');
@@ -635,14 +664,14 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
     }
     const token = newToken(DEVICE_TOKEN_PREFIX);
     store.createDevice(r.user.id, kind, body.name.trim() || 'Telefono', sha256(token));
-    store.audit(r.user.id, 'dispositivo_aggiunto', req.ip, body.name.slice(0, 60));
+    store.audit(r.user.id, 'dispositivo_aggiunto', req.clientIp, body.name.slice(0, 60));
     return reply.code(201).send({ token, username: r.user.username, last: store.readingStats().last });
   });
 
   /** "Scollega" in the app: the phone revokes its own token (allowed even without write permission). */
   app.delete('/api/v1/devices/self', { preHandler: requireDevice }, async (req, reply) => {
     store.deleteDevice(req.deviceId!, req.deviceUser!);
-    store.audit(req.deviceUser!, 'dispositivo_rimosso', req.ip, "dall'app");
+    store.audit(req.deviceUser!, 'dispositivo_rimosso', req.clientIp, "dall'app");
     return reply.code(204).send();
   });
 
@@ -701,7 +730,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
   });
 
   app.post('/api/v1/readings', {
-    preHandler: requireUploader,
+    onRequest: requireUploader, // before reading and decompressing the body
     preParsing: gunzipBody,
     bodyLimit: 512 * 1024,
     schema: {
@@ -724,7 +753,7 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
 
   /** Blood glucose meter results from the sensor phone: [[unix seconds, mg/dL, meter name | null], …]. */
   app.post('/api/v1/fingersticks', {
-    preHandler: requireUploader,
+    onRequest: requireUploader,
     schema: {
       body: {
         type: 'object', required: ['f'], additionalProperties: false,

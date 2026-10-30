@@ -173,7 +173,8 @@ Con Docker: `docker compose exec g7server node src/cli.ts <comando>`.
 | `G7_HOST` / `G7_PORT` | `127.0.0.1` / `8080` | indirizzo di ascolto |
 | `G7_DB` | `data/g7.db` | file del database |
 | `G7_ORIGIN` | — | indirizzo pubblico (es. `https://glicemie.example.com`), usato per il controllo CSRF |
-| `G7_TRUST_PROXY` | — | `true` dietro un reverse proxy |
+| `G7_TRUST_PROXY` | — | `true` dietro un reverse proxy sulla stessa macchina o in rete locale (si fida solo degli indirizzi locali e privati), oppure l'elenco degli indirizzi dei proxy |
+| `G7_CLIENT_IP_HEADER` | — | header con l'indirizzo reale del visitatore messo dalla CDN (`CF-Connecting-IP` con Cloudflare); letto solo sulle richieste arrivate dal proxy |
 | `G7_PEPPER` | — | segreto di almeno 32 caratteri per le password; se lo perdi, le password vanno reimpostate |
 | `G7_COOKIE_SECURE` | `true` | `false` solo per prove in rete locale senza HTTPS |
 
