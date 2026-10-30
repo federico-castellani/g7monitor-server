@@ -11,6 +11,7 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/app.js"></script>
+  <script type="module" src="/report.js"></script>
 </head>
 <body>
 
@@ -52,6 +53,10 @@
 <div id="app" class="app" hidden>
   <header class="topbar">
     <div class="brand"><img src="/favicon.svg" alt="" width="28" height="28"><span>G7 Monitor</span></div>
+    <nav class="tabs" id="tabs" aria-label="Sezioni">
+      <a href="#oggi" data-view="today">Oggi</a>
+      <a href="#report" data-view="report">Report</a>
+    </nav>
     <div class="spacer"></div>
     <span id="live" class="live" title="Aggiornamento in tempo reale"><i></i><span>Live</span></span>
     <button id="open-users" class="icon-btn" type="button" aria-label="Gestione utenti" hidden>
@@ -62,7 +67,7 @@
     </button>
   </header>
 
-  <main class="content">
+  <main class="content" id="view-today">
     <section class="card hero" id="hero">
       <div class="hero-main">
         <div class="value"><span id="cur-value">––</span><span id="cur-arrow" class="arrow"></span></div>
@@ -76,7 +81,7 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card chart-card">
       <div class="card-head">
         <h2>Andamento</h2>
         <div class="seg" id="window" role="group" aria-label="Intervallo del grafico">
@@ -90,7 +95,7 @@
       <div id="chart" class="chart" role="img" aria-label="Grafico della glicemia"><div id="tip" class="tip" hidden></div></div>
     </section>
 
-    <section class="card">
+    <section class="card stats-card">
       <div class="card-head"><h2>Statistiche</h2><span class="muted" id="stats-span"></span></div>
       <div class="tir" id="tir" aria-label="Tempo nei range">
         <div class="tir-bar"><i class="low"></i><i class="in"></i><i class="high"></i></div>
@@ -109,6 +114,28 @@
     </section>
 
     <p class="disclaimer">Non è un dispositivo medico: per decisioni terapeutiche usa un dispositivo approvato.</p>
+  </main>
+
+  <main class="content report" id="view-report" hidden>
+    <section class="card report-head">
+      <div>
+        <h2>Report glicemico</h2>
+        <p class="muted small" id="rep-range">–</p>
+      </div>
+      <div class="report-tools">
+        <div class="seg" id="rep-period" role="group" aria-label="Periodo del report">
+          <button type="button" data-days="7">7 giorni</button>
+          <button type="button" data-days="14">14</button>
+          <button type="button" data-days="30">30</button>
+          <button type="button" data-days="90">90</button>
+        </div>
+        <button type="button" class="btn small" id="rep-print">Stampa / PDF</button>
+        <button type="button" class="btn small" id="rep-csv">Esporta CSV</button>
+      </div>
+    </section>
+    <div id="rep-body" class="report-body" aria-live="polite"></div>
+    <p class="disclaimer">Obiettivi del consenso internazionale sul tempo nel range (2019) per la maggior parte degli adulti con diabete di tipo 1 e 2:
+      i tuoi possono essere diversi, parlane con il tuo diabetologo. Non è un dispositivo medico.</p>
   </main>
 </div>
 

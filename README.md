@@ -7,6 +7,7 @@ Server per [G7 Monitor](https://github.com/federico-castellani/g7monitor). Racco
 ## Cosa fa
 
 - **Interfaccia web**: valore attuale con freccia di tendenza, grafico 3 h / 6 h / 12 h / 24 h / 7 giorni (tocca o passa sopra per leggere il singolo valore), tempo nei range, media, GMI, variabilità. Tema chiaro/scuro, adatta al telefono, installabile come app.
+- **Report** (scheda *Report*, 7/14/30/90 giorni), sul modello del report AGP e del consenso internazionale sul tempo nel range (2019): parametri principali (media, GMI, CV, deviazione standard, uso del sensore, range stretto 70–140), tempo nei 5 intervalli con gli obiettivi, profilo glicemico ambulatoriale (percentili 5–95 per ora del giorno), andamenti per fascia oraria con gli episodi di bassa e alta, confronto con il periodo precedente, glucometro rispetto al sensore (MARD), giorno per giorno, statistiche orarie. Si stampa o si salva in PDF dal pulsante *Stampa / PDF*; *Esporta CSV* scarica tutte le letture del periodo (apribile con Excel).
 - **Aggiornamento in tempo reale**: la pagina riceve le letture appena il telefono le carica (Server-Sent Events), senza ricaricare.
 - **Glucometro**: le misurazioni capillari che l'app riceve da un glucometro Bluetooth compaiono sul grafico come rombi con il valore, in tempo reale, e arrivano anche ai telefoni che ricevono.
 - **Due ruoli**:

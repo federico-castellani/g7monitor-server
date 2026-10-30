@@ -16,6 +16,7 @@ function loadPrefs() {
 const prefs = loadPrefs();
 function savePrefs() {
   try { localStorage.setItem('g7prefs', JSON.stringify(prefs)); } catch { /* private mode */ }
+  document.dispatchEvent(new Event('g7:prefs')); // the report redraws with the new unit
 }
 
 // ------------------------------------------------------------------ API
@@ -389,6 +390,7 @@ function showOnly(id) {
 }
 
 function showLogin() {
+  document.dispatchEvent(new Event('g7:logout'));
   stream?.close();
   stream = null;
   me = null;
@@ -413,6 +415,7 @@ function showApp() {
   markPressed($('window'), 'h', String(prefs.hours));
   connectStream();
   loadReadings().catch(() => {});
+  document.dispatchEvent(new Event('g7:ready'));
 }
 
 async function boot() {
@@ -791,5 +794,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 setInterval(() => { if (me && !$('app').hidden) render(); }, 30_000);
+
+/** What the report page (report.js) shares with this page: preferences, API and formatting. */
+window.g7 = { prefs, api, fmt, fmtDelta, unitLabel, isMmol };
 
 boot();
