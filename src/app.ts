@@ -13,6 +13,7 @@ import { authenticate } from './auth.ts';
 import type { Credentials } from './auth.ts';
 import { hashPassword, passwordProblem, verifyPassword } from './security/password.ts';
 import { DEVICE_TOKEN_PREFIX, DEVICE_TOKEN_RE, SESSION_TOKEN_RE, newToken, sha256 } from './security/tokens.ts';
+import { newTotpSecret, otpauthUri, verifyTotp } from './security/totp.ts';
 
 /** A browser session ends after 14 days without use, and in any case after 60 days. */
 export const SESSION_IDLE = 14 * 86400;
@@ -417,6 +418,84 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
 
   app.get('/api/activity', { preHandler: requireAuth }, async (req) => store.recentAudit(req.auth!.user.id));
 
+  // ----- profile: open browsers
+
+  app.get('/api/me/sessions', { preHandler: requireAuth }, async (req) => {
+    const current = req.auth!.tokenHash.toString('hex');
+    return store.listSessions(req.auth!.user.id).map((s) => ({ ...s, current: s.id === current }));
+  });
+
+  app.delete('/api/me/sessions/:id', {
+    preHandler: requireAuth,
+    schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } } },
+  }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!store.deleteUserSession(req.auth!.user.id, Buffer.from(id, 'hex'))) {
+      return reply.code(404).send({ error: 'non_trovato', message: 'Sessione non trovata' });
+    }
+    store.audit(req.auth!.user.id, 'sessione_chiusa', req.clientIp);
+    return reply.code(204).send();
+  });
+
+  // ----- profile: two-step verification (TOTP), set up from the web
+
+  /** Secrets offered but not confirmed yet (10 minutes): nothing changes until the first code is right. */
+  const pendingTotp = new Map<number, { secret: string; until: number }>();
+  const tooMany = (reply: FastifyReply) => reply.code(429).send({ error: 'troppi_tentativi', message: 'Troppi tentativi: riprova tra qualche minuto' });
+
+  app.post('/api/me/totp/setup', { preHandler: requireAuth }, async (req, reply) => {
+    const u = req.auth!.user;
+    if (u.totpSecret) return reply.code(409).send({ error: 'gia_attiva', message: 'La verifica in due passaggi è già attiva' });
+    const secret = newTotpSecret();
+    pendingTotp.set(u.id, { secret, until: now() + 600 });
+    return { secret, uri: otpauthUri('G7 Monitor', u.username, secret) };
+  });
+
+  app.post('/api/me/totp/enable', {
+    preHandler: requireAuth,
+    schema: { body: { type: 'object', required: ['code'], additionalProperties: false, properties: { code: credentialsProps.totp } } },
+  }, async (req, reply) => {
+    const u = req.auth!.user;
+    if (store.ipBlocked(req.clientIp)) return tooMany(reply);
+    const pending = pendingTotp.get(u.id);
+    if (!pending || pending.until < now()) return reply.code(400).send({ error: 'scaduto', message: 'Richiesta scaduta: ricomincia l\'attivazione' });
+    const step = verifyTotp(pending.secret, (req.body as { code: string }).code, null);
+    if (step === null) {
+      store.recordIpFailure(req.clientIp);
+      return reply.code(400).send({ error: 'codice_non_valido', message: 'Codice non valido: controlla l\'ora del telefono e riprova' });
+    }
+    pendingTotp.delete(u.id);
+    store.setTotp(u.id, pending.secret);
+    store.setTotpStep(u.id, step);
+    store.audit(u.id, '2fa_attivata', req.clientIp);
+    return publicUser(store.userById(u.id)!);
+  });
+
+  app.post('/api/me/totp/disable', {
+    preHandler: requireAuth,
+    schema: {
+      body: {
+        type: 'object', required: ['password', 'code'], additionalProperties: false,
+        properties: { password: credentialsProps.password, code: credentialsProps.totp },
+      },
+    },
+  }, async (req, reply) => {
+    const u = req.auth!.user;
+    const { password, code } = req.body as { password: string; code: string };
+    if (store.ipBlocked(req.clientIp)) return tooMany(reply);
+    if (!u.totpSecret) return reply.code(409).send({ error: 'non_attiva', message: 'La verifica in due passaggi non è attiva' });
+    const passwordOk = (await verifyPassword(u.passwordHash, password, cfg.pepper)).ok;
+    const step = passwordOk ? verifyTotp(u.totpSecret, code, u.totpLastStep) : null;
+    if (step === null) {
+      store.recordIpFailure(req.clientIp);
+      store.audit(u.id, 'cambio_2fa_fallito', req.clientIp);
+      return reply.code(400).send({ error: 'non_valido', message: 'Password o codice non validi' });
+    }
+    store.setTotp(u.id, null);
+    store.audit(u.id, '2fa_disattivata', req.clientIp);
+    return publicUser(store.userById(u.id)!);
+  });
+
   /** Phones: admins see and revoke all of them, users only their own. */
   app.get('/api/devices', { preHandler: requireAuth }, async (req) => {
     const u = req.auth!.user;
@@ -522,6 +601,12 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
 
   // ================================================================ web: user management (admins)
 
+  app.get('/api/admin/overview', { preHandler: requireAdmin }, async () => ({
+    ...store.overview(), version: VERSION, streams: hub.size,
+  }));
+
+  app.get('/api/admin/audit', { preHandler: requireAdmin }, async () => store.allAudit());
+
   app.get('/api/admin/users', { preHandler: requireAdmin }, async () =>
     store.listUsers().map((u) => ({
       ...publicUser(u),
@@ -566,12 +651,16 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
       params: idParams,
       body: {
         type: 'object', additionalProperties: false, minProperties: 1,
-        properties: { role: { type: 'string', enum: ['admin', 'user'] }, canWrite: { type: 'boolean' }, unlock: { type: 'boolean' } },
+        properties: {
+          role: { type: 'string', enum: ['admin', 'user'] }, canWrite: { type: 'boolean' }, unlock: { type: 'boolean' },
+          // a user who lost the phone with the authenticator app
+          resetTotp: { type: 'boolean', const: true },
+        },
       },
     },
   }, async (req, reply) => {
     const { id } = req.params as { id: number };
-    const b = req.body as { role?: Role; canWrite?: boolean; unlock?: boolean };
+    const b = req.body as { role?: Role; canWrite?: boolean; unlock?: boolean; resetTotp?: true };
     const admin = req.auth!.user;
     const target = store.userById(id);
     if (!target) return reply.code(404).send({ error: 'non_trovato', message: 'Utente non trovato' });
@@ -589,6 +678,10 @@ export function buildApp(cfg: Config, store: Store, opts: AppOptions = {}): Fast
         store.audit(id, b.canWrite ? 'scrittura_consentita' : 'solo_lettura', null, admin.username);
       }
       if (b.unlock) store.unlock(id);
+      if (b.resetTotp && target.totpSecret) {
+        store.setTotp(id, null);
+        store.audit(id, '2fa_azzerata', null, admin.username);
+      }
     });
     store.audit(admin.id, 'utente_modificato', req.clientIp, target.username);
     return publicUser(store.userById(id)!);

@@ -221,6 +221,23 @@ export class Store {
     else this.q('DELETE FROM sessions WHERE user_id = ?').run(userId);
   }
 
+  /** The user's browsers. The id is the token's SHA-256: it identifies a session but cannot open one. */
+  listSessions(userId: number): { id: string; createdAt: number; lastSeen: number; ip: string | null; userAgent: string | null }[] {
+    return (this.q('SELECT token_hash, created_at, last_seen, ip, user_agent FROM sessions WHERE user_id = ? ORDER BY last_seen DESC')
+      .all(userId) as Row[]).map((r) => ({
+      id: Buffer.from(r.token_hash as Uint8Array).toString('hex'),
+      createdAt: Number(r.created_at),
+      lastSeen: Number(r.last_seen),
+      ip: (r.ip as string | null) ?? null,
+      userAgent: (r.user_agent as string | null) ?? null,
+    }));
+  }
+
+  /** Closes one of the user's own sessions; false if it is not theirs (or no longer exists). */
+  deleteUserSession(userId: number, tokenHash: Buffer): boolean {
+    return Number(this.q('DELETE FROM sessions WHERE user_id = ? AND token_hash = ?').run(userId, tokenHash).changes) > 0;
+  }
+
   /** Housekeeping: expired sessions and old throttling/audit rows. */
   purge(idleSeconds: number, maxSeconds: number): void {
     const t = now();
@@ -335,6 +352,22 @@ export class Store {
     return s.all(since, limit) as unknown as FingerRow[];
   }
 
+  /** Figures for the administration page. */
+  overview() {
+    const one = (sql: string) => this.q(sql).get() as Row;
+    const users = one(`SELECT COUNT(*) AS n, SUM(role = 'admin') AS admins, SUM(locked_until > unixepoch()) AS locked,
+      SUM(totp_secret IS NOT NULL) AS totp FROM users`);
+    const devices = one(`SELECT COUNT(*) AS n, SUM(kind = 'uploader') AS up FROM devices`);
+    const readings = one('SELECT COUNT(*) AS n, MIN(ts) AS first, MAX(ts) AS last FROM readings');
+    return {
+      users: Number(users.n), admins: Number(users.admins ?? 0), locked: Number(users.locked ?? 0), withTotp: Number(users.totp ?? 0),
+      devices: Number(devices.n), uploaders: Number(devices.up ?? 0),
+      readings: Number(readings.n), firstReading: num(readings.first), lastReading: num(readings.last),
+      fingersticks: Number(one('SELECT COUNT(*) AS n FROM fingersticks').n),
+      sessions: Number(one('SELECT COUNT(*) AS n FROM sessions').n),
+    };
+  }
+
   readingStats(): { count: number; last: number | null } {
     const r = this.q('SELECT COUNT(*) AS n, MAX(ts) AS t FROM readings').get() as Row;
     return { count: Number(r.n), last: num(r.t) };
@@ -344,6 +377,16 @@ export class Store {
 
   audit(userId: number | null, event: string, ip: string | null, detail: string | null = null): void {
     this.q('INSERT INTO audit (user_id, at, event, ip, detail) VALUES (?, ?, ?, ?, ?)').run(userId, now(), event, ip, detail);
+  }
+
+  /** Everyone's events, newest first, for the administrators. */
+  allAudit(limit = 150): { at: number; event: string; ip: string | null; detail: string | null; username: string | null }[] {
+    return (this.q(`SELECT a.at, a.event, a.ip, a.detail, u.username FROM audit a LEFT JOIN users u ON u.id = a.user_id
+      ORDER BY a.at DESC, a.id DESC LIMIT ?`).all(limit) as Row[])
+      .map((r) => ({
+        at: Number(r.at), event: String(r.event), ip: (r.ip as string | null) ?? null,
+        detail: (r.detail as string | null) ?? null, username: (r.username as string | null) ?? null,
+      }));
   }
 
   recentAudit(userId: number, limit = 30): { at: number; event: string; ip: string | null; detail: string | null }[] {

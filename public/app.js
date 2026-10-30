@@ -386,8 +386,27 @@ function renderStats() {
 
 function showOnly(id) {
   for (const v of ['login', 'force-pw', 'app']) $(v).hidden = v !== id;
-  for (const d of ['settings', 'users']) if ($(d).open) $(d).close();
+  if ($('day-dialog').open) $('day-dialog').close();
 }
+
+/** Pages of the app, chosen by the address (#report, #profilo, #admin): the back button works. */
+const VIEWS = { '#report': 'report', '#profilo': 'profile', '#admin': 'admin' };
+
+function showView() {
+  if (!me || $('app').hidden) return;
+  let view = VIEWS[location.hash] ?? 'today';
+  if (view === 'admin' && me.role !== 'admin') view = 'today';
+  for (const v of ['today', 'report', 'profile', 'admin']) $(`view-${v}`).hidden = v !== view;
+  for (const a of $('tabs').querySelectorAll('a')) a.toggleAttribute('aria-current', a.dataset.view === view);
+  $('open-users').toggleAttribute('aria-current', view === 'admin');
+  $('open-settings').toggleAttribute('aria-current', view === 'profile');
+  window.scrollTo(0, 0);
+  if (view === 'today') renderChart(); // it measures its box, hidden until now
+  if (view === 'profile') renderProfile();
+  if (view === 'admin') renderAdmin();
+  document.dispatchEvent(new CustomEvent('g7:view', { detail: view }));
+}
+window.addEventListener('hashchange', showView);
 
 function showLogin() {
   document.dispatchEvent(new Event('g7:logout'));
@@ -415,7 +434,9 @@ function showApp() {
   markPressed($('window'), 'h', String(prefs.hours));
   connectStream();
   loadReadings().catch(() => {});
+  $('avatar').textContent = me.username.slice(0, 1).toUpperCase();
   document.dispatchEvent(new Event('g7:ready'));
+  showView();
 }
 
 async function boot() {
@@ -466,11 +487,19 @@ const EVENTS = {
   password_utente_reimpostata: 'Hai reimpostato la password di',
   '2fa_attivata': 'Verifica in due passaggi attivata',
   '2fa_disattivata': 'Verifica in due passaggi disattivata',
+  '2fa_azzerata': 'Verifica in due passaggi azzerata da',
+  cambio_2fa_fallito: 'Tentativo di disattivare la verifica in due passaggi',
+  sessione_chiusa: 'Browser scollegato',
 };
+/** Events about access and security, for the administrators' filter. */
+const SECURITY = new Set([
+  'password_errata', 'codice_2fa_errato', 'login_bloccato', 'cambio_password_fallito', 'cambio_2fa_fallito',
+  '2fa_attivata', '2fa_disattivata', '2fa_azzerata', 'password_cambiata', 'password_reimpostata', 'ruolo_cambiato',
+]);
 /** Events whose detail is a name worth showing (never a user agent). */
 const WITH_DETAIL = new Set([
   'dispositivo_aggiunto', 'account_creato_da_admin', 'password_reimpostata', 'ruolo_cambiato', 'scrittura_consentita',
-  'solo_lettura', 'utente_creato', 'utente_modificato', 'utente_eliminato', 'password_utente_reimpostata',
+  'solo_lettura', 'utente_creato', 'utente_modificato', 'utente_eliminato', 'password_utente_reimpostata', '2fa_azzerata',
 ]);
 
 function li(main, sub, ...buttons) {
@@ -501,16 +530,18 @@ function emptyItem(text) {
   return item;
 }
 
-async function loadDevices() {
-  const devices = await api('/api/devices');
-  const admin = me.role === 'admin';
-  $('devices').replaceChildren(...(devices.length ? devices.map((d) => {
+/** @param all every account's phones (admin page); otherwise only the user's own. */
+async function loadDevices(all = false) {
+  const list = all ? $('admin-devices') : $('devices');
+  const devices = (await api('/api/devices')).filter((d) => all || d.username === me.username);
+  const admin = all;
+  list.replaceChildren(...(devices.length ? devices.map((d) => {
     const reader = d.kind === 'reader';
     const remove = button('Rimuovi', 'danger-outline', async () => {
       const effect = reader ? 'smetterà di ricevere' : 'smetterà di caricare';
       if (!confirm(`Rimuovere "${d.name}"? Il telefono ${effect} le glicemie finché non viene ricollegato.`)) return;
       await api(`/api/devices/${d.id}`, { method: 'DELETE' }).catch((e) => alert(e.message));
-      loadDevices();
+      loadDevices(all);
     });
     const last = d.lastUsed ? `ultimo contatto ${dateTimeFmt.format(d.lastUsed * 1000)}` : 'mai usato';
     const who = admin ? `${d.username} · ` : '';
@@ -527,22 +558,209 @@ async function loadActivity() {
   }) : [emptyItem('Nessuna attività')]));
 }
 
-function openSettings() {
+function renderProfile() {
   markPressed($('unit-seg'), 'unit', prefs.unit);
   $('range-low').value = prefs.low;
   $('range-high').value = prefs.high;
-  $('account-info').textContent = `Accesso come ${me.username} · ${roleLabel(me)}`;
-  $('devices-help').textContent = me.role === 'admin'
-    ? 'Tutti i telefoni collegati: quelli che caricano le glicemie dal sensore e quelli che le ricevono. Rimuovili qui se vengono persi.'
-    : 'I tuoi telefoni collegati dall\'app G7 Monitor. Rimuovili qui se li perdi.';
-  $('twofa').textContent = me.totp
-    ? 'Verifica in due passaggi attiva.'
-    : 'Verifica in due passaggi non attiva: si attiva dal server con "npm run user -- totp-on".';
+  $('avatar-lg').textContent = me.username.slice(0, 1).toUpperCase();
+  $('profile-name').textContent = me.username;
+  $('account-info').textContent = roleLabel(me);
   $('pw-form').elements.username.value = me.username;
   $('pw-msg').textContent = '';
-  $('settings').showModal();
+  renderTwofa();
+  loadSessions().catch(() => {});
   loadDevices().catch(() => {});
   loadActivity().catch(() => {});
+}
+
+/** "Chrome su Windows" from a user agent: enough to recognise one's own browsers. */
+function browserName(ua) {
+  if (!ua) return 'Browser sconosciuto';
+  const b = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /SamsungBrowser/.test(ua) ? 'Samsung Internet'
+    : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const os = /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iPhone/iPad' : /Windows/.test(ua) ? 'Windows'
+    : /Mac OS X/.test(ua) ? 'Mac' : /Linux/.test(ua) ? 'Linux' : '';
+  return os ? `${b} su ${os}` : b;
+}
+
+async function loadSessions() {
+  const sessions = await api('/api/me/sessions');
+  $('sessions').replaceChildren(...sessions.map((s) => {
+    const when = `attivo ${dateTimeFmt.format(s.lastSeen * 1000)}${s.ip ? ' · ' + s.ip : ''}`;
+    if (s.current) {
+      const item = li(`${browserName(s.userAgent)}`, when);
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = 'questo browser';
+      item.append(tag);
+      return item;
+    }
+    return li(browserName(s.userAgent), when, button('Scollega', 'danger-outline', async () => {
+      await api(`/api/me/sessions/${s.id}`, { method: 'DELETE' }).catch((e) => alert(e.message));
+      loadSessions().catch(() => {});
+    }));
+  }));
+}
+
+function field(label, input) {
+  const l = document.createElement('label');
+  l.className = 'field';
+  const span = document.createElement('span');
+  span.textContent = label;
+  l.append(span, input);
+  return l;
+}
+
+function codeInput() {
+  const i = document.createElement('input');
+  Object.assign(i, { inputMode: 'numeric', autocomplete: 'one-time-code', maxLength: 6, placeholder: '6 cifre', required: true });
+  i.pattern = '[0-9]{6}';
+  return i;
+}
+
+function paragraph(text, cls = 'muted small') {
+  const p = document.createElement('p');
+  p.className = cls;
+  p.textContent = text;
+  return p;
+}
+
+/** Two-step verification: status, set-up with the authenticator app, or turning it off. */
+function renderTwofa() {
+  const box = $('twofa');
+  const msg = paragraph('', 'error');
+  msg.setAttribute('role', 'status');
+  if (me.totp) {
+    const form = document.createElement('form');
+    form.className = 'stack';
+    const pw = document.createElement('input');
+    Object.assign(pw, { type: 'password', autocomplete: 'current-password', required: true });
+    const code = codeInput();
+    const off = document.createElement('button');
+    off.type = 'submit';
+    off.className = 'btn danger-outline';
+    off.textContent = 'Disattiva';
+    form.append(field('Password', pw), field('Codice dall\'app di autenticazione', code), msg, off);
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        me = await api('/api/me/totp/disable', { method: 'POST', body: { password: pw.value, code: code.value.trim() } });
+        renderProfile();
+      } catch (ex) { msg.textContent = ex.message; }
+    };
+    const status = paragraph('', 'status-line ok');
+    status.textContent = '● Attiva: oltre alla password, all\'accesso serve il codice dell\'app di autenticazione.';
+    box.replaceChildren(status, paragraph('Per disattivarla conferma con password e codice.'), form);
+    return;
+  }
+  const start = button('Attiva', 'primary', async () => {
+    try {
+      const { secret, uri } = await api('/api/me/totp/setup', { method: 'POST' });
+      const key = document.createElement('code');
+      key.className = 'secret';
+      key.textContent = secret.match(/.{1,4}/g).join(' ');
+      const open = document.createElement('a');
+      open.className = 'btn small';
+      open.href = uri;
+      open.textContent = 'Apri nell\'app di autenticazione';
+      const copy = button('Copia chiave', '', () => navigator.clipboard?.writeText(secret));
+      const actions = document.createElement('div');
+      actions.className = 'input-row';
+      actions.append(open, copy);
+      const form = document.createElement('form');
+      form.className = 'stack';
+      const code = codeInput();
+      const ok = document.createElement('button');
+      ok.type = 'submit';
+      ok.className = 'btn primary';
+      ok.textContent = 'Conferma e attiva';
+      form.append(field('Codice di 6 cifre mostrato dall\'app', code), msg, ok);
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          me = await api('/api/me/totp/enable', { method: 'POST', body: { code: code.value.trim() } });
+          renderProfile();
+        } catch (ex) { msg.textContent = ex.message; }
+      };
+      // Our own encoder (qr.js): the CSP allows no outside scripts. Only numbers and fixed text in the SVG.
+      const qr = document.createElement('div');
+      qr.className = 'qr-box';
+      qr.innerHTML = window.g7qr.svg(uri, 'QR code per l\'app di autenticazione');
+      box.replaceChildren(
+        paragraph('1. Inquadra il QR code con un\'app di autenticazione (Google Authenticator, Microsoft Authenticator, Aegis…).'),
+        qr,
+        paragraph('Non puoi inquadrarlo? Inserisci la chiave a mano, oppure, da questo telefono, apri direttamente l\'app:'),
+        key, actions,
+        paragraph('2. Scrivi qui il codice che l\'app mostra: la verifica si attiva solo se è giusto.'),
+        form,
+      );
+      code.focus();
+    } catch (ex) { msg.textContent = ex.message; box.append(msg); }
+  });
+  box.replaceChildren(
+    paragraph('Non attiva. Con la verifica in due passaggi, a chi scopre la tua password serve anche il tuo telefono.'),
+    start, msg,
+  );
+}
+
+// ------------------------------------------------------------------ administration page
+
+async function renderAdmin() {
+  usersMessage('');
+  const form = $('new-user');
+  if (!form.password.value) form.password.value = randomPassword();
+  markPressed($('audit-filter'), 'f', auditFilter);
+  loadOverview().catch(() => {});
+  loadUsers().catch((e) => usersMessage(e.message));
+  loadDevices(true).catch(() => {});
+  loadAudit().catch(() => {});
+}
+
+function tile(label, value, note = '') {
+  const t = document.createElement('div');
+  t.className = 'tile';
+  const s = document.createElement('span');
+  s.textContent = label;
+  const b = document.createElement('b');
+  b.textContent = value;
+  t.append(s, b);
+  if (note) {
+    const n = document.createElement('small');
+    n.textContent = note;
+    t.append(n);
+  }
+  return t;
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+async function loadOverview() {
+  const o = await api('/api/admin/overview');
+  const ago = o.lastReading ? Math.round((Date.now() / 1000 - o.lastReading) / 60) : null;
+  $('admin-version').textContent = `versione ${o.version}`;
+  $('overview').replaceChildren(
+    tile('Utenti', String(o.users), `${plural(o.admins, 'amministratore', 'amministratori')}${o.locked ? ` · ${plural(o.locked, 'bloccato', 'bloccati')}` : ''}`),
+    tile('Verifica in due passaggi', `${o.withTotp} su ${o.users}`, 'account protetti'),
+    tile('Telefoni', String(o.devices), `${o.uploaders} caricano · ${o.devices - o.uploaders} ricevono`),
+    tile('Ultima lettura', ago == null ? '–' : ago < 1 ? 'adesso' : ago < 120 ? `${ago} min fa` : dateTimeFmt.format(o.lastReading * 1000),
+      ago != null && ago > 15 ? 'il telefono non carica' : ''),
+    tile('Letture salvate', o.readings.toLocaleString('it-IT'), o.firstReading ? `dal ${new Date(o.firstReading * 1000).toLocaleDateString('it-IT')}` : ''),
+    tile('Glucometro', o.fingersticks.toLocaleString('it-IT'), 'misurazioni'),
+    tile('Collegati ora', String(o.streams), plural(o.sessions, 'sessione web aperta', 'sessioni web aperte')),
+  );
+}
+
+let auditFilter = 'all';
+
+async function loadAudit() {
+  const items = (await api('/api/admin/audit')).filter((a) => auditFilter === 'all' || SECURITY.has(a.event));
+  $('audit').replaceChildren(...(items.length ? items.map((a) => {
+    const label = EVENTS[a.event] ?? a.event;
+    const what = WITH_DETAIL.has(a.event) && a.detail ? `${label} ${a.detail}` : label;
+    const item = li(`${a.username ?? 'utente eliminato'} · ${what}`, `${dateTimeFmt.format(a.at * 1000)}${a.ip ? ' · ' + a.ip : ''}`);
+    if (SECURITY.has(a.event) && /errat|fallit|bloccat/.test(a.event)) item.classList.add('alert');
+    return item;
+  }) : [emptyItem('Nessun evento')]));
 }
 
 // ------------------------------------------------------------------ user management (admins)
@@ -598,6 +816,13 @@ async function loadUsers() {
 
     controls.append(role, writeLabel);
     if (u.locked) controls.append(button('Sblocca', '', () => update(u, { unlock: true })));
+    if (u.totp && !self) {
+      controls.append(button('Azzera 2FA', '', () => {
+        if (confirm(`Azzerare la verifica in due passaggi di "${u.username}"? Potrà entrare con la sola password e riattivarla dal suo profilo.`)) {
+          update(u, { resetTotp: true });
+        }
+      }));
+    }
     if (!self) {
       controls.append(button('Reimposta password', '', async () => {
         const pw = randomPassword();
@@ -632,14 +857,7 @@ async function update(u, body) {
   loadUsers().catch(() => {});
 }
 
-function openUsers() {
-  usersMessage('');
-  const form = $('new-user');
-  form.reset();
-  form.password.value = randomPassword();
-  $('users').showModal();
-  loadUsers().catch((e) => usersMessage(e.message));
-}
+
 
 // ------------------------------------------------------------------ events
 
@@ -709,15 +927,13 @@ chart.addEventListener('pointerleave', stopInspect);
 chart.addEventListener('pointercancel', stopInspect);
 new ResizeObserver(() => renderChart()).observe(chart);
 
-$('open-settings').addEventListener('click', openSettings);
-$('close-settings').addEventListener('click', () => $('settings').close());
-$('open-users').addEventListener('click', openUsers);
-$('close-users').addEventListener('click', () => $('users').close());
-for (const id of ['settings', 'users']) {
-  $(id).addEventListener('click', (e) => {
-    if (e.target === e.currentTarget) e.currentTarget.close(); // click on the backdrop
-  });
-}
+$('audit-filter').addEventListener('click', (e) => {
+  const f = e.target.closest('button')?.dataset.f;
+  if (!f) return;
+  auditFilter = f;
+  markPressed($('audit-filter'), 'f', f);
+  loadAudit().catch(() => {});
+});
 
 $('unit-seg').addEventListener('click', (e) => {
   const unit = e.target.closest('button')?.dataset.unit;

@@ -10,6 +10,7 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/qr.js"></script>
   <script type="module" src="/app.js"></script>
   <script type="module" src="/report.js"></script>
 </head>
@@ -59,12 +60,10 @@
     </nav>
     <div class="spacer"></div>
     <span id="live" class="live" title="Aggiornamento in tempo reale"><i></i><span>Live</span></span>
-    <button id="open-users" class="icon-btn" type="button" aria-label="Gestione utenti" hidden>
+    <a id="open-users" class="icon-btn" href="#admin" aria-label="Amministrazione" title="Amministrazione" hidden>
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm0 2c-3.3 0-7 1.7-7 4.2V20h14v-1.8C16 15.7 12.3 14 9 14Zm7.5-2.2a3.3 3.3 0 1 0-.9-6.4 5.9 5.9 0 0 1 0 5.6c.3.5.6.8.9.8Zm1.3 2.4c1.4.9 2.2 2.1 2.2 3.9V20h2v-1.8c0-1.9-1.9-3.3-4.2-4Z"/></svg>
-    </button>
-    <button id="open-settings" class="icon-btn" type="button" aria-label="Impostazioni">
-      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm7.4-2.5a7.6 7.6 0 0 0 0-2l2.1-1.6-2-3.4-2.5 1a7.4 7.4 0 0 0-1.7-1L15 3.4h-4l-.4 2.6a7.4 7.4 0 0 0-1.7 1l-2.5-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6 2 3.4 2.5-1a7.4 7.4 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.4 7.4 0 0 0 1.7-1l2.5 1 2-3.4-2.1-1.6Z"/></svg>
-    </button>
+    </a>
+    <a id="open-settings" class="avatar-btn" href="#profilo" aria-label="Profilo e impostazioni" title="Profilo e impostazioni"><span id="avatar">?</span></a>
   </header>
 
   <main class="content" id="view-today">
@@ -137,93 +136,143 @@
     <p class="disclaimer">Obiettivi del consenso internazionale sul tempo nel range (2019) per la maggior parte degli adulti con diabete di tipo 1 e 2:
       i tuoi possono essere diversi, parlane con il tuo diabetologo. Non è un dispositivo medico.</p>
   </main>
+
+  <main class="content page" id="view-profile" hidden>
+    <section class="card profile-head">
+      <div class="avatar-lg" id="avatar-lg">?</div>
+      <div class="profile-id">
+        <h2 id="profile-name">–</h2>
+        <p class="muted small" id="account-info"></p>
+      </div>
+      <div class="profile-actions">
+        <button type="button" class="btn small" id="logout">Esci</button>
+        <button type="button" class="btn small danger-outline" id="logout-all">Esci da tutti i browser</button>
+      </div>
+    </section>
+
+    <div class="page-grid">
+      <section class="card">
+        <h3>Visualizzazione</h3>
+        <p class="muted small">Valgono per questo browser.</p>
+        <div class="row">
+          <span>Unità</span>
+          <div class="seg" id="unit-seg">
+            <button type="button" data-unit="mgdl">mg/dL</button>
+            <button type="button" data-unit="mmol">mmol/L</button>
+          </div>
+        </div>
+        <div class="row">
+          <span>Intervallo target (mg/dL)</span>
+          <div class="range-inputs">
+            <input id="range-low" type="number" min="54" max="120" step="1" aria-label="Limite basso">
+            <span>–</span>
+            <input id="range-high" type="number" min="120" max="300" step="1" aria-label="Limite alto">
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3>Verifica in due passaggi</h3>
+        <div id="twofa"></div>
+      </section>
+
+      <section class="card">
+        <h3>Password</h3>
+        <form id="pw-form" class="stack">
+          <input type="text" name="username" autocomplete="username" hidden>
+          <label class="field"><span>Password attuale</span><input name="current" type="password" autocomplete="current-password" required></label>
+          <label class="field"><span>Nuova password (almeno 12 caratteri)</span><input name="next" type="password" autocomplete="new-password" minlength="12" required></label>
+          <label class="field"><span>Ripeti la nuova password</span><input name="again" type="password" autocomplete="new-password" minlength="12" required></label>
+          <p class="error" id="pw-msg" role="status"></p>
+          <button type="submit" class="btn">Cambia password</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h3>Browser collegati</h3>
+        <p class="muted small">Dove il tuo account è aperto ora. Chiudi quelli che non riconosci.</p>
+        <ul class="list" id="sessions"></ul>
+      </section>
+
+      <section class="card">
+        <h3>I tuoi telefoni</h3>
+        <p class="muted small" id="devices-help">Il telefono si collega dall'app G7 Monitor (Impostazioni → Server). Rimuovilo qui se lo perdi.</p>
+        <ul class="list" id="devices"></ul>
+      </section>
+
+      <section class="card">
+        <h3>Attività recente</h3>
+        <ul class="list compact" id="activity"></ul>
+      </section>
+    </div>
+    <p class="disclaimer">Non è un dispositivo medico: per decisioni terapeutiche usa un dispositivo approvato.</p>
+  </main>
+
+  <main class="content page" id="view-admin" hidden>
+    <section class="card">
+      <div class="card-head"><h2>Amministrazione</h2><span class="muted small" id="admin-version"></span></div>
+      <div class="tiles" id="overview"></div>
+    </section>
+
+    <div class="page-grid admin-grid">
+      <section class="card span-2">
+        <div class="card-head"><h2>Utenti</h2></div>
+        <p class="muted small">
+          Tutti gli utenti vedono le glicemie. Gli <b>amministratori</b> possono anche caricarle e gestire gli utenti;
+          un <b>utente</b> può caricarle solo se glielo consenti.
+        </p>
+        <p class="error" id="users-msg" role="status"></p>
+        <ul class="list users" id="user-list"></ul>
+      </section>
+
+      <section class="card">
+        <h3>Nuovo utente</h3>
+        <form id="new-user" class="stack" autocomplete="off">
+          <label class="field"><span>Nome utente</span><input name="username" pattern="[a-zA-Z0-9._\-]{3,32}" maxlength="32" autocapitalize="none" spellcheck="false" required></label>
+          <label class="field"><span>Password temporanea (dovrà cambiarla al primo accesso)</span>
+            <span class="input-row"><input name="password" type="text" minlength="12" required autocomplete="off" spellcheck="false"><button type="button" class="btn small" id="gen-pw">Genera</button></span>
+          </label>
+          <div class="row">
+            <span>Ruolo</span>
+            <select name="role" class="compact-select"><option value="user">Utente</option><option value="admin">Amministratore</option></select>
+          </div>
+          <label class="check"><input type="checkbox" name="canWrite"> Può caricare glicemie (collegare un telefono)</label>
+          <button type="submit" class="btn primary">Crea utente</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h3>Tutti i telefoni</h3>
+        <p class="muted small">Quelli che caricano dal sensore e quelli che ricevono. Rimuovi quelli persi o non più usati.</p>
+        <ul class="list" id="admin-devices"></ul>
+      </section>
+
+      <section class="card span-2">
+        <div class="card-head">
+          <h3>Registro attività</h3>
+          <div class="seg" id="audit-filter" role="group" aria-label="Filtro del registro">
+            <button type="button" data-f="all">Tutto</button>
+            <button type="button" data-f="security">Sicurezza</button>
+          </div>
+        </div>
+        <ul class="list compact" id="audit"></ul>
+      </section>
+    </div>
+  </main>
 </div>
 
-<dialog id="settings" class="sheet" aria-labelledby="settings-title">
+
+
+<dialog id="day-dialog" class="sheet wide" aria-labelledby="day-title">
   <div class="sheet-head">
-    <h2 id="settings-title">Impostazioni</h2>
-    <button type="button" class="icon-btn" id="close-settings" aria-label="Chiudi">✕</button>
+    <button type="button" class="icon-btn" id="day-prev" aria-label="Giorno precedente">‹</button>
+    <h2 id="day-title">–</h2>
+    <button type="button" class="icon-btn" id="day-next" aria-label="Giorno successivo">›</button>
+    <div class="spacer"></div>
+    <button type="button" class="icon-btn" id="day-close" aria-label="Chiudi">✕</button>
   </div>
-
-  <section class="group">
-    <h3>Visualizzazione</h3>
-    <div class="row">
-      <span>Unità</span>
-      <div class="seg" id="unit-seg">
-        <button type="button" data-unit="mgdl">mg/dL</button>
-        <button type="button" data-unit="mmol">mmol/L</button>
-      </div>
-    </div>
-    <div class="row">
-      <span>Intervallo target (mg/dL)</span>
-      <div class="range-inputs">
-        <input id="range-low" type="number" min="54" max="120" step="1" aria-label="Limite basso">
-        <span>–</span>
-        <input id="range-high" type="number" min="120" max="300" step="1" aria-label="Limite alto">
-      </div>
-    </div>
-  </section>
-
-  <section class="group">
-    <h3>Account</h3>
-    <p class="muted small" id="account-info"></p>
-  </section>
-
-  <section class="group" id="devices-group">
-    <h3>Telefoni collegati</h3>
-    <p class="muted small" id="devices-help">Il telefono si collega dall'app G7 Monitor (Impostazioni → Server). Rimuovilo qui se lo perdi.</p>
-    <ul class="list" id="devices"></ul>
-  </section>
-
-  <section class="group">
-    <h3>Sicurezza</h3>
-    <p class="muted small" id="twofa"></p>
-    <form id="pw-form" class="stack">
-      <input type="text" name="username" autocomplete="username" hidden>
-      <label class="field"><span>Password attuale</span><input name="current" type="password" autocomplete="current-password" required></label>
-      <label class="field"><span>Nuova password (almeno 12 caratteri)</span><input name="next" type="password" autocomplete="new-password" minlength="12" required></label>
-      <label class="field"><span>Ripeti la nuova password</span><input name="again" type="password" autocomplete="new-password" minlength="12" required></label>
-      <p class="error" id="pw-msg" role="status"></p>
-      <button type="submit" class="btn">Cambia password</button>
-    </form>
-    <button type="button" class="btn danger-outline" id="logout-all">Esci da tutti i browser</button>
-  </section>
-
-  <section class="group">
-    <h3>Attività recente</h3>
-    <ul class="list compact" id="activity"></ul>
-  </section>
-
-  <button type="button" class="btn danger" id="logout">Esci</button>
-</dialog>
-
-<dialog id="users" class="sheet" aria-labelledby="users-title">
-  <div class="sheet-head">
-    <h2 id="users-title">Utenti</h2>
-    <button type="button" class="icon-btn" id="close-users" aria-label="Chiudi">✕</button>
-  </div>
-  <p class="muted small">
-    Tutti gli utenti vedono le glicemie. Gli <b>amministratori</b> possono anche caricarle e gestire gli utenti;
-    un <b>utente</b> può caricarle solo se glielo consenti.
-  </p>
-  <p class="error" id="users-msg" role="status"></p>
-  <ul class="list users" id="user-list"></ul>
-
-  <section class="group">
-    <h3>Nuovo utente</h3>
-    <form id="new-user" class="stack" autocomplete="off">
-      <label class="field"><span>Nome utente</span><input name="username" pattern="[a-zA-Z0-9._\-]{3,32}" maxlength="32" autocapitalize="none" spellcheck="false" required></label>
-      <label class="field"><span>Password temporanea (dovrà cambiarla al primo accesso)</span>
-        <span class="input-row"><input name="password" type="text" minlength="12" required autocomplete="off" spellcheck="false"><button type="button" class="btn small" id="gen-pw">Genera</button></span>
-      </label>
-      <div class="row">
-        <span>Ruolo</span>
-        <select name="role" class="compact-select"><option value="user">Utente</option><option value="admin">Amministratore</option></select>
-      </div>
-      <label class="check"><input type="checkbox" name="canWrite"> Può caricare glicemie (collegare un telefono)</label>
-      <button type="submit" class="btn primary">Crea utente</button>
-    </form>
-  </section>
+  <p class="muted small" id="day-stats"></p>
+  <div id="day-chart" class="chart day-chart"><div id="day-tip" class="tip" hidden></div></div>
 </dialog>
 
 </body>

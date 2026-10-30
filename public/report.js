@@ -4,7 +4,6 @@
 
 const g7 = window.g7;
 const $ = (id) => document.getElementById(id);
-const DAY = 86_400_000;
 const STEP = 300_000; // the G7 reads every 5 minutes
 
 const VLOW = 54, LOW = 70, HIGH = 180, VHIGH = 250, TIGHT = 140;
@@ -44,8 +43,8 @@ async function load() {
   $('rep-body').innerHTML = '<section class="card"><p class="muted">Calcolo del report…</p></section>';
   try {
     const end = Date.now();
-    const start = startOfDay(end - (days - 1) * DAY);
-    const prevStart = start - days * DAY;
+    const start = addDays(startOfDay(end), -(days - 1));
+    const prevStart = addDays(start, -days);
     const s = (ms) => Math.floor(ms / 1000);
     const [cur, prev] = await Promise.all([
       g7.api(`/api/readings?from=${s(start)}&to=${s(end)}`),
@@ -67,6 +66,13 @@ async function load() {
 function startOfDay(ms) {
   const d = new Date(ms);
   d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/** Midnight n calendar days later: a day lasts 23 or 25 hours when daylight saving time changes. */
+function addDays(midnight, n) {
+  const d = new Date(midnight);
+  d.setDate(d.getDate() + n);
   return d.getTime();
 }
 
@@ -327,19 +333,19 @@ function patternsSection(r, m) {
 
 function dailySection(r, start, end) {
   const dayList = [];
-  for (let d = startOfDay(end); d >= start; d -= DAY) dayList.push(d);
+  for (let d = startOfDay(end); d >= start; d = addDays(d, -1)) dayList.push(d);
   const shown = dayList.slice(0, 31);
   const W = 240, H = 70, T = 4, B = 4;
   const y = (v) => T + (1 - (Math.min(Math.max(v, 40), 350) - 40) / 310) * (H - T - B);
   let best = null;
   const cards = shown.map((d) => {
-    const next = d + DAY;
+    const next = addDays(d, 1);
     const dr = r.filter((x) => x.t >= d && x.t < next);
     const m = metrics(dr, d, next);
     if (m.n && m.wear >= 70 && (!best || m.tir > best.tir)) best = { d, tir: m.tir };
     let path = '', prev = null;
     for (const x of dr) {
-      const px = ((x.t - d) / DAY) * W;
+      const px = ((x.t - d) / (next - d)) * W;
       path += `${prev && x.t - prev.t <= 12 * 60_000 ? 'L' : 'M'}${px.toFixed(1)} ${y(x.v).toFixed(1)}`;
       prev = x;
     }
@@ -348,7 +354,7 @@ function dailySection(r, start, end) {
       <path class="day-trace" d="${path}"/></svg>` };
   });
   const html = cards.map(({ d, m, svg }) => `
-    <div class="day ${best?.d === d ? 'best' : ''}">
+    <div class="day ${best?.d === d ? 'best' : ''}" data-day="${d}" role="button" tabindex="0" aria-label="Apri ${dayFmt.format(d)}">
       <div class="day-head"><b>${dayFmt.format(d)}</b>
         <span>${m.n ? `${pct0(m.tir)} nel range` : 'nessun dato'}</span></div>
       ${best?.d === d ? '<div class="best-tag">★ Giorno migliore</div>' : ''}
@@ -358,7 +364,7 @@ function dailySection(r, start, end) {
   return `
   <section class="card wide">
     <div class="card-head"><h2>Giorno per giorno</h2>
-      <span class="muted small">${dayList.length > shown.length ? `ultimi ${shown.length} giorni` : ''}</span></div>
+      <span class="muted small">${dayList.length > shown.length ? `ultimi ${shown.length} giorni · ` : ''}tocca un giorno per ingrandirlo</span></div>
     <div class="days">${html}</div>
   </section>`;
 }
@@ -490,23 +496,150 @@ function exportCsv() {
   setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
 }
 
-// ------------------------------------------------------------------ navigation between "Oggi" and "Report"
+// ------------------------------------------------------------------ one day, enlarged (from "Giorno per giorno")
 
-let ready = false;
+let dayShown = null;
+let dayGeom = null;
 
-function showView() {
-  const report = location.hash === '#report';
-  $('view-today').hidden = report;
-  $('view-report').hidden = !report;
-  for (const a of $('tabs').querySelectorAll('a')) a.toggleAttribute('aria-current', (a.dataset.view === 'report') === report);
-  if (report && ready && !data) load();
-  if (!report) window.dispatchEvent(new Event('resize')); // the chart measures itself again
+function openDay(d) {
+  dayShown = d;
+  const dlg = $('day-dialog');
+  if (!dlg.open) dlg.showModal();
+  drawDay();
 }
 
-window.addEventListener('hashchange', showView);
-document.addEventListener('g7:ready', () => { ready = true; showView(); });
-document.addEventListener('g7:logout', () => { ready = false; data = null; $('rep-body').innerHTML = ''; });
-document.addEventListener('g7:prefs', () => render());
+function drawDay() {
+  if (dayShown == null || !data) return;
+  const d = dayShown, next = addDays(d, 1);
+  const r = data.r.filter((x) => x.t >= d && x.t < next);
+  const sticks = data.f.filter((x) => x.t >= d && x.t < next);
+  const m = metrics(r, d, next);
+  $('day-title').textContent = new Intl.DateTimeFormat('it-IT', { weekday: 'long', day: 'numeric', month: 'long' }).format(d);
+  $('day-stats').textContent = m.n
+    ? `${pct0(m.tir)} nel range · media ${glucose(m.mean)} · min ${g7.fmt(m.min)} · max ${g7.fmt(m.max)}` +
+      `${m.lows.length ? ` · ${m.lows.length} ${m.lows.length === 1 ? 'episodio' : 'episodi'} di bassa` : ''}${sticks.length ? ` · ${sticks.length} glucometro` : ''}`
+    : 'Nessuna lettura in questo giorno';
+  $('day-prev').disabled = addDays(d, -1) < data.start;
+  $('day-next').disabled = next > data.end;
+
+  const el = $('day-chart');
+  const W = el.clientWidth, H = el.clientHeight;
+  if (!W || !H) return;
+  const padL = 34, padR = 8, padT = 10, padB = 22;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxV = Math.max(250, ...r.map((x) => x.v), ...sticks.map((x) => x.v));
+  const yMax = Math.min(400, (Math.floor((maxV + 25) / 50) + 1) * 50), yMin = 40;
+  const x = (t) => padL + ((t - d) / (next - d)) * plotW;
+  const y = (v) => padT + (1 - (Math.min(Math.max(v, yMin), yMax) - yMin) / (yMax - yMin)) * plotH;
+  const f = (n) => n.toFixed(1);
+  const cls = (v) => (v < LOW ? 'low' : v > HIGH ? 'high' : 'in');
+  const out = [`<rect class="band" x="${padL}" y="${f(y(HIGH))}" width="${plotW}" height="${f(y(LOW) - y(HIGH))}" rx="6"/>`];
+  for (let v = 50; v < yMax; v += 50) {
+    out.push(`<line class="grid" x1="${padL}" x2="${W - padR}" y1="${f(y(v))}" y2="${f(y(v))}"/>`);
+    out.push(`<text class="axis" x="${padL - 6}" y="${f(y(v) + 4)}" text-anchor="end">${g7.isMmol() ? Math.round(v / 18.0182) : v}</text>`);
+  }
+  for (let h = 0; h <= 24; h += 3) {
+    const tick = new Date(d);
+    tick.setHours(h);
+    const xx = x(h === 24 ? next : tick.getTime());
+    out.push(`<line class="vgrid" x1="${f(xx)}" x2="${f(xx)}" y1="${padT}" y2="${padT + plotH}"/>`);
+    if (h < 24) out.push(`<text class="axis" x="${f(xx)}" y="${H - 4}" text-anchor="${h ? 'middle' : 'start'}">${String(h).padStart(2, '0')}:00</text>`);
+  }
+  let path = '', prev = null;
+  for (const p of r) {
+    path += `${prev && p.t - prev.t <= 12 * 60_000 ? 'L' : 'M'}${f(x(p.t))} ${f(y(p.v))}`;
+    prev = p;
+  }
+  out.push(`<path class="trace" d="${path}"/>`);
+  for (const p of r) out.push(`<circle class="${cls(p.v)}" cx="${f(x(p.t))}" cy="${f(y(p.v))}" r="2.6"/>`);
+  for (const s of sticks) {
+    const cx = x(s.t), cy = y(s.v), h = 8;
+    const dia = (k) => `M${f(cx)} ${f(cy - k)}L${f(cx + k)} ${f(cy)}L${f(cx)} ${f(cy + k)}L${f(cx - k)} ${f(cy)}Z`;
+    out.push(`<path class="finger-halo" d="${dia(h + 2.5)}"/><path class="finger" d="${dia(h)}"/><circle class="finger-dot" cx="${f(cx)}" cy="${f(cy)}" r="2"/>`);
+  }
+  if (!r.length) out.push(`<text class="empty" x="${padL + plotW / 2}" y="${padT + plotH / 2}" text-anchor="middle">Nessuna lettura</text>`);
+  out.push('<g id="day-cursor"></g>');
+  let svg = el.querySelector('svg');
+  if (!svg) {
+    svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    el.prepend(svg);
+  }
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.innerHTML = out.join('');
+  dayGeom = { x, y, r, sticks, padT, plotH, W };
+  $('day-tip').hidden = true;
+}
+
+/** Reading (or meter result) under the pointer, as on the main chart. */
+function inspectDay(clientX) {
+  if (!dayGeom) return;
+  const { x, y, r, sticks, padT, plotH, W } = dayGeom;
+  const px = clientX - $('day-chart').getBoundingClientRect().left;
+  const stick = sticks.filter((s) => Math.abs(x(s.t) - px) <= 14).sort((a, b) => Math.abs(x(a.t) - px) - Math.abs(x(b.t) - px))[0];
+  const tip = $('day-tip');
+  let cx, text, detail = '';
+  if (stick) {
+    cx = x(stick.t);
+    const sensor = sensorAt(data.r, stick.t);
+    text = `Glucometro ${glucose(stick.v)} · ${timeFmt.format(stick.t)}`;
+    detail = sensor == null ? 'Nessuna lettura del sensore in quel momento' : `Sensore ${g7.fmt(sensor)} · differenza ${g7.fmtDelta(stick.v - sensor)} ${g7.unitLabel()}`;
+    $('day-cursor').innerHTML = `<line class="finger-focus" x1="${cx}" x2="${cx}" y1="${padT}" y2="${padT + plotH}"/>`;
+  } else {
+    if (!r.length) return;
+    const p = r.reduce((a, b) => (Math.abs(x(b.t) - px) < Math.abs(x(a.t) - px) ? b : a));
+    cx = x(p.t);
+    text = `${glucose(p.v)} · ${timeFmt.format(p.t)}`;
+    $('day-cursor').innerHTML = `<line class="cursor" x1="${cx}" x2="${cx}" y1="${padT}" y2="${padT + plotH}"/>` +
+      `<circle class="focus ${p.v < LOW ? 'low' : p.v > HIGH ? 'high' : 'in'}" cx="${cx}" cy="${y(p.v)}" r="6"/>`;
+  }
+  tip.classList.toggle('finger-tip', !!stick);
+  const title = document.createElement('div');
+  title.textContent = text;
+  tip.replaceChildren(title);
+  if (detail) {
+    const dd = document.createElement('div');
+    dd.className = 'tip-detail';
+    dd.textContent = detail;
+    tip.append(dd);
+  }
+  tip.hidden = false;
+  const half = tip.offsetWidth / 2;
+  tip.style.left = `${Math.min(Math.max(cx, half), W - half)}px`;
+}
+
+function stopInspectDay() {
+  const c = document.getElementById('day-cursor');
+  if (c) c.innerHTML = '';
+  $('day-tip').hidden = true;
+}
+
+const dayChart = $('day-chart');
+dayChart.addEventListener('pointerdown', (e) => inspectDay(e.clientX));
+dayChart.addEventListener('pointermove', (e) => inspectDay(e.clientX));
+dayChart.addEventListener('pointerleave', stopInspectDay);
+new ResizeObserver(() => { if ($('day-dialog').open) drawDay(); }).observe(dayChart);
+$('day-prev').addEventListener('click', () => { dayShown = addDays(dayShown, -1); drawDay(); });
+$('day-next').addEventListener('click', () => { dayShown = addDays(dayShown, 1); drawDay(); });
+$('day-close').addEventListener('click', () => $('day-dialog').close());
+$('day-dialog').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });
+$('day-dialog').addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft' && !$('day-prev').disabled) $('day-prev').click();
+  if (e.key === 'ArrowRight' && !$('day-next').disabled) $('day-next').click();
+});
+$('rep-body').addEventListener('click', (e) => {
+  const day = e.target.closest('.day');
+  if (day) openDay(Number(day.dataset.day));
+});
+$('rep-body').addEventListener('keydown', (e) => {
+  const day = e.target.closest('.day');
+  if (day && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openDay(Number(day.dataset.day)); }
+});
+
+// ------------------------------------------------------------------ page shown or left (navigation lives in app.js)
+
+document.addEventListener('g7:view', (e) => { if (e.detail === 'report' && !data) load(); });
+document.addEventListener('g7:logout', () => { data = null; $('rep-body').innerHTML = ''; });
+document.addEventListener('g7:prefs', () => { render(); if ($('day-dialog').open) drawDay(); });
 
 $('rep-period').addEventListener('click', (e) => {
   const n = Number(e.target.closest('button')?.dataset.days);
@@ -520,4 +653,3 @@ $('rep-print').addEventListener('click', () => {
   window.print();
 });
 $('rep-csv').addEventListener('click', exportCsv);
-showView();

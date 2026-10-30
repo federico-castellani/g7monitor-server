@@ -590,3 +590,65 @@ describe('hardening', () => {
     assert.deepEqual(proxied.json(), { ok: true });
   });
 });
+
+// ------------------------------------------------------------------ profile and administration pages
+
+describe('profile and administration', () => {
+  test('a user sees their browsers and can close another one, never someone else\'s', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'anna');
+    await addUser(store, 'bruno');
+    const a1 = await login(app, 'anna');
+    const a2 = await login(app, 'anna');
+    const b = await login(app, 'bruno');
+    const list = (await web(app, a1.cookie, 'GET', '/api/me/sessions')).json() as { id: string; current: boolean }[];
+    assert.equal(list.length, 2);
+    assert.equal(list.filter((s) => s.current).length, 1);
+    const other = list.find((s) => !s.current)!;
+    const bruno = (await web(app, b.cookie, 'GET', '/api/me/sessions')).json()[0].id as string;
+    assert.equal((await web(app, a1.cookie, 'DELETE', `/api/me/sessions/${bruno}`)).statusCode, 404);
+    assert.equal((await web(app, a1.cookie, 'DELETE', `/api/me/sessions/${other.id}`)).statusCode, 204);
+    assert.equal((await web(app, a2.cookie, 'GET', '/api/me')).statusCode, 401);
+    assert.equal((await web(app, b.cookie, 'GET', '/api/me')).statusCode, 200);
+  });
+
+  test('two-step verification is set up from the web, active only after a right code', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'carla');
+    const { cookie } = await login(app, 'carla');
+    const { secret, uri } = (await web(app, cookie, 'POST', '/api/me/totp/setup')).json() as { secret: string; uri: string };
+    assert.match(uri, /^otpauth:\/\/totp\/G7%20Monitor:carla\?secret=/);
+    assert.equal((await web(app, cookie, 'POST', '/api/me/totp/enable', { code: '000000' })).statusCode, 400);
+    assert.equal(store.userByName('carla')!.totpSecret, null);
+    const code = totpCode(base32Decode(secret), Math.floor(Date.now() / 30_000));
+    const on = await web(app, cookie, 'POST', '/api/me/totp/enable', { code });
+    assert.equal(on.statusCode, 200);
+    assert.equal(on.json().totp, true);
+    // from now on the login needs the code
+    assert.equal((await login(app, 'carla')).res.json().error, 'totp_richiesto');
+    // turning it off needs password and a new code
+    assert.equal((await web(app, cookie, 'POST', '/api/me/totp/disable', { password: 'sbagliata-sbagliata', code })).statusCode, 400);
+    const next = totpCode(base32Decode(secret), Math.floor(Date.now() / 30_000) + 1);
+    assert.equal((await web(app, cookie, 'POST', '/api/me/totp/disable', { password: PASSWORD, code: next })).statusCode, 200);
+    assert.equal(store.userByName('carla')!.totpSecret, null);
+  });
+
+  test('administrators get the overview, everyone\'s activity, and can reset a lost 2FA', async () => {
+    const { app, store } = setup();
+    await addUser(store, 'admin', 'admin');
+    const id = await addUser(store, 'dario');
+    store.setTotp(id, newTotpSecret());
+    const user = await login(app, 'dario', PASSWORD, totpCode(base32Decode(store.userById(id)!.totpSecret!), Math.floor(Date.now() / 30_000)));
+    assert.equal((await web(app, user.cookie, 'GET', '/api/admin/overview')).statusCode, 403);
+    assert.equal((await web(app, user.cookie, 'GET', '/api/admin/audit')).statusCode, 403);
+    const { cookie } = await login(app, 'admin');
+    const o = (await web(app, cookie, 'GET', '/api/admin/overview')).json();
+    assert.equal(o.users, 2);
+    assert.equal(o.admins, 1);
+    assert.equal(o.withTotp, 1);
+    const audit = (await web(app, cookie, 'GET', '/api/admin/audit')).json() as { username: string; event: string }[];
+    assert.ok(audit.some((a) => a.username === 'dario' && a.event === 'accesso_web'));
+    assert.equal((await web(app, cookie, 'PATCH', `/api/admin/users/${id}`, { resetTotp: true })).statusCode, 200);
+    assert.equal(store.userById(id)!.totpSecret, null);
+  });
+});
